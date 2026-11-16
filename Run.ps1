@@ -40,7 +40,7 @@ $WorkDir    = Join-Path $env:ProgramData 'ssh443'
 $LogFile    = Join-Path $WorkDir 'tunnel.log'
 $SetupLog   = Join-Path $WorkDir 'setup.log'
 # Windows build version - its own counter, bumped on every change (1.0 -> 1.1 -> ...)
-$WinVer     = '1.0'
+$WinVer     = '1.1'
 
 function Write-Step   ($m) { Write-Host "  [*] $m" -ForegroundColor Cyan }
 function Write-Ok     ($m) { Write-Host "  [v] $m" -ForegroundColor Green }
@@ -327,6 +327,15 @@ function Set-SshdMultiOption {
     Set-Content -LiteralPath $Config -Value $out -Encoding ASCII
 }
 
+function Remove-SshdOption {
+    # drop a directive (and its commented form) from sshd_config
+    param([string]$Config, [string]$Name)
+    $esc = [regex]::Escape($Name)
+    Get-Content -LiteralPath $Config |
+        Where-Object { $_ -notmatch ("^\s*#?\s*" + $esc + "(\s|$)") } |
+        Set-Content -LiteralPath $Config -Encoding ASCII
+}
+
 Set-SshdOption -Config $sshdConfig -Name 'Port'                  -Value $SshPort
 Set-SshdOption -Config $sshdConfig -Name 'PasswordAuthentication' -Value 'yes'
 Set-SshdOption -Config $sshdConfig -Name 'PubkeyAuthentication'   -Value 'yes'
@@ -343,6 +352,13 @@ Set-SshdOption -Config $sshdConfig -Name 'MaxStartups'            -Value '100:30
 Set-SshdOption -Config $sshdConfig -Name 'MaxSessions'            -Value '100'
 # explicit host keys (absolute paths) so sshd never has to guess where they are
 Set-SshdMultiOption -Config $sshdConfig -Name 'HostKey' -Values $hostKeyPaths
+# Some Windows images ship a default config containing:
+#     AllowGroups administrators "openssh users"
+# sshd then denies EVERY local user that is not in one of those groups, and the
+# client only sees "Password authentication failed" even when the password is
+# correct.  The Linux original has no such restriction (the script creates a
+# single dedicated user), so the gate is removed to guarantee login.
+Remove-SshdOption -Config $sshdConfig -Name 'AllowGroups'
 
 # Keep authorised keys in a fixed, per-user location under ProgramData instead of
 # the user profile ("%USERPROFILE%\.ssh") - the profile of a fresh local account
@@ -431,31 +447,31 @@ $sec  = ConvertTo-SecureString $Pass -AsPlainText -Force
 $userName = if ($User -match '\\') { $User.Split('\')[-1] } else { $User }
 $existing = Get-LocalUser -Name $userName -ErrorAction SilentlyContinue
 if ($existing) {
-    Set-LocalUser -Name $userName -Password $sec
-    if (-not $existing.Enabled) { Enable-LocalUser -Name $userName }
-    Write-Warn2 "User already existed - password updated"
+    Write-Warn2 'User already existed - resetting the password'
 } else {
     New-LocalUser -Name $userName -Password $sec -PasswordNeverExpires -AccountNeverExpires -Description 'SSH tunnel account' | Out-Null
     Write-Ok 'User created'
 }
+# always re-assert everything password authentication depends on - this is
+# idempotent and repairs an account an earlier install/(un)install left half set up
+try { Enable-LocalUser -Name $userName -ErrorAction Stop } catch { }
+try { Set-LocalUser -Name $userName -Password $sec -PasswordNeverExpires $true -ErrorAction Stop }
+catch { Write-Warn2 "could not set the password : $($_.Exception.Message)" }
 if ($userName -ne 'Administrator') {
-    # the shipped sshd_config has:  AllowGroups administrators "openssh users"
-    # so every SSH login must be a member of that group (or of administrators)
-    if (-not (Get-LocalGroup -Name 'openssh users' -ErrorAction SilentlyContinue)) {
-        New-LocalGroup -Name 'openssh users' -Description 'OpenSSH login users' | Out-Null
-        Write-Step "Created local group 'openssh users'"
-    }
-    Add-LocalGroupMember -Group 'openssh users' -Member $userName -ErrorAction SilentlyContinue
-    try { Add-LocalGroupMember -Group 'Users' -Member $userName -ErrorAction SilentlyContinue } catch { }
+    # some Windows images ship sshd_config with:  AllowGroups administrators "openssh users"
+    # every SSH login must then be a member of one of those groups or sshd answers
+    # "Password authentication failed" although the password is correct
+    try { Add-LocalGroupMember -Group 'openssh users' -Member $userName -ErrorAction Stop } catch { }
+    try { Add-LocalGroupMember -Group 'Users'         -Member $userName -ErrorAction SilentlyContinue } catch { }
 }
 # make sure the account is NOT an administrator (mirrors the linux non-root user)
 try {
-    $admins = Get-LocalGroupMember -Group 'Administrators' -ErrorAction SilentlyContinue
-    if ($admins -and ($admins.Name -split '\\')[-1] -contains $userName) {
-        Remove-LocalGroupMember -Group 'Administrators' -Member $userName -ErrorAction SilentlyContinue
-    }
+    $admins = @(Get-LocalGroupMember -Group 'Administrators' -ErrorAction SilentlyContinue | ForEach-Object { ($_.Name -split '\\')[-1] })
+    if ($admins -contains $userName) { Remove-LocalGroupMember -Group 'Administrators' -Member $userName -ErrorAction SilentlyContinue }
 } catch { }
-Write-Ok "User $userName ready (password auth)"
+$inSshGroup = $false
+try { $inSshGroup = [bool](@(Get-LocalGroupMember -Group 'openssh users' -ErrorAction Stop | ForEach-Object { ($_.Name -split '\\')[-1] }) -contains $userName) } catch { }
+Write-Ok ("User {0} ready (password auth)  |  in 'openssh users': {1}" -f $userName, $inSshGroup)
 
 # ------------------------------------------------------------------ 4. firewall
 Write-Step 'Firewall : opening ports'
