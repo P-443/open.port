@@ -40,7 +40,7 @@ $WorkDir    = Join-Path $env:ProgramData 'ssh443'
 $LogFile    = Join-Path $WorkDir 'tunnel.log'
 $SetupLog   = Join-Path $WorkDir 'setup.log'
 # Windows build version - its own counter, bumped on every change (1.0 -> 1.1 -> ...)
-$WinVer     = '1.2'
+$WinVer     = '1.3'
 
 function Write-Step   ($m) { Write-Host "  [*] $m" -ForegroundColor Cyan }
 function Write-Ok     ($m) { Write-Host "  [v] $m" -ForegroundColor Green }
@@ -77,7 +77,7 @@ if ($NoUdpgw) { $UdpGwPort = 0 }
 
 Write-Host ""
 Write-Host "  ------------------------------------------------------------------"
-Write-Ok "Input accepted : User=$User  Pass=$Pass  Port=$Port"
+Write-Ok "Input accepted : User=$User  Pass=$Pass  Port=$Port  (pass length: $($Pass.Length))"
 Write-Host "  ------------------------------------------------------------------"
 Write-Host ""
 
@@ -473,6 +473,38 @@ try {
 $inSshGroup = $false
 try { $inSshGroup = [bool](@(Get-LocalGroupMember -Group 'openssh users' -ErrorAction Stop | ForEach-Object { ($_.Name -split '\\')[-1] }) -contains $userName) } catch { }
 Write-Ok ("User {0} ready (password auth)  |  in 'openssh users': {1}" -f $userName, $inSshGroup)
+
+# --- verify the password the SAME way sshd does -------------------------------
+# sshd authenticates with LogonUser(..., LOGON32_LOGON_NETWORK).  We run exactly
+# that check here, so a password that did not get stored correctly is caught now
+# instead of later showing up as "Password authentication failed" on the client.
+if (-not ('Ssh443LogonCheck' -as [type])) {
+    Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public static class Ssh443LogonCheck {
+    [DllImport("advapi32.dll", SetLastError=true, CharSet=CharSet.Unicode)]
+    public static extern bool LogonUser(string u, string d, string p, int type, int provider, out IntPtr token);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    public static extern bool CloseHandle(IntPtr h);
+    public static int Check(string u, string p) {
+        IntPtr t;
+        if (LogonUser(u, ".", p, 3, 0, out t)) { CloseHandle(t); return 0; }
+        return Marshal.GetLastWin32Error();
+    }
+}
+"@
+}
+$pwCheck = -1
+try { $pwCheck = [Ssh443LogonCheck]::Check($userName, $Pass) } catch { }
+if ($pwCheck -ne 0) {
+    Write-Warn2 "password check failed (win32 error $pwCheck) - re-applying it with 'net user'"
+    try { Set-LocalUser -Name $userName -Password $sec -ErrorAction SilentlyContinue } catch { }
+    try { & net.exe user $userName $Pass 2>&1 | Out-Null } catch { }
+    $pwCheck = -1; try { $pwCheck = [Ssh443LogonCheck]::Check($userName, $Pass) } catch { }
+}
+if ($pwCheck -eq 0) { Write-Ok "Password verified for $userName (Windows logon test passed)" }
+else { Write-Warn2 "Password could NOT be verified (win32 error $pwCheck) - SSH password login will fail" }
 
 # ------------------------------------------------------------------ 4. firewall
 Write-Step 'Firewall : opening ports'
