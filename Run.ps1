@@ -167,16 +167,83 @@ if (-not (Test-SshdPresent)) {
     exit 1
 }
 $OpenSshDir = Get-SshdDir
-try { Set-Service -Name sshd -StartupType Automatic -ErrorAction Stop } catch { }
+$sshdExe    = Join-Path $OpenSshDir 'sshd.exe'
+$keygenExe  = Join-Path $OpenSshDir 'ssh-keygen.exe'
 Write-Ok "OpenSSH Server : binaries -> $OpenSshDir"
-$sshDir = Join-Path $env:ProgramData 'ssh'
-if (-not (Test-Path $sshDir)) { New-Item -ItemType Directory -Force -Path $sshDir | Out-Null }
 
-# host keys
-if (-not (Test-Path (Join-Path $sshDir 'ssh_host_rsa_key'))) {
-    Write-Step 'OpenSSH Server : generating host keys'
-    & (Join-Path $OpenSshDir 'ssh-keygen.exe') -A | Out-Null
+# make sure the sshd service exists AND points at the binary we just installed.
+# A leftover service from an older/partial install can point at a path that no
+# longer exists -> "Failed to start service 'OpenSSH SSH Server (sshd)'".
+try {
+    $svc = Get-CimInstance Win32_Service -Filter "Name='sshd'" -ErrorAction SilentlyContinue
+    if (-not $svc) {
+        New-Service -Name sshd -BinaryPathName "`"$sshdExe`"" -DisplayName 'OpenSSH SSH Server' -StartupType Automatic | Out-Null
+        Write-Step 'OpenSSH Server : created the sshd service'
+    } elseif ($svc.PathName -and ($svc.PathName -notlike "*$OpenSshDir*")) {
+        Write-Warn2 "sshd service pointed at '$($svc.PathName)' - repointing it to $sshdExe"
+        & sc.exe config sshd binPath= "`"$sshdExe`"" | Out-Null
+    }
+} catch { Write-Warn2 "could not verify the sshd service : $($_.Exception.Message)" }
+try { Set-Service -Name sshd -StartupType Automatic -ErrorAction Stop } catch { }
+
+$sshDir  = Join-Path $env:ProgramData 'ssh'
+if (-not (Test-Path $sshDir)) { New-Item -ItemType Directory -Force -Path $sshDir | Out-Null }
+$sshLogs = Join-Path $sshDir 'logs'
+if (-not (Test-Path $sshLogs)) { New-Item -ItemType Directory -Force -Path $sshLogs | Out-Null }
+
+# the shipped sshd_config contains:  AllowGroups administrators "openssh users"
+# The "OpenSSH Users" group (S-1-5-32-585) ships with the OpenSSH *capability*,
+# but the Win32-OpenSSH zip does not create it - and sshd refuses to start when
+# an AllowGroups entry cannot be resolved.  Create it *before* sshd starts.
+if (-not (Get-LocalGroup -Name 'openssh users' -ErrorAction SilentlyContinue)) {
+    try { New-LocalGroup -Name 'openssh users' -Description 'OpenSSH login users' | Out-Null; Write-Step "OpenSSH Server : created local group 'openssh users'" } catch { }
 }
+
+# --- pick a free internal SSH port ---------------------------------------
+# A fresh cloud image can already have something bound to port 22 (provider
+# agent, a second sshd, ...).  sshd would then fail to start and the 443 tunnel
+# would forward to the wrong service.  Detect that and move to a free port.
+function Get-PortOwner([int]$p) {
+    $c = Get-NetTCPConnection -LocalPort $p -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $c) { return $null }
+    return (Get-Process -Id $c.OwningProcess -ErrorAction SilentlyContinue)
+}
+$owner = Get-PortOwner $SshPort
+if ($owner -and $owner.ProcessName -ne 'sshd') {
+    Write-Warn2 "internal port $SshPort is used by '$($owner.ProcessName)' (pid $($owner.Id)) - moving sshd to a free port"
+    foreach ($cand in 2222, 22222, 2200, 2022, 8022, 22022, 4422, 22223) {
+        if (-not (Get-PortOwner $cand)) { $SshPort = $cand; break }
+    }
+    Write-Ok "OpenSSH Server : sshd will listen on internal port $SshPort"
+}
+
+# --- host keys -----------------------------------------------------------
+# Generated explicitly (one per type) instead of relying on "ssh-keygen -A":
+# that is deterministic, verifiable, and any missing/empty key is repaired.
+Write-Step 'OpenSSH Server : generating host keys'
+$hostKeyDefs = @(
+    @{ t = 'rsa';     f = 'ssh_host_rsa_key';     extra = @('-b', '3072') },
+    @{ t = 'ecdsa';   f = 'ssh_host_ecdsa_key';   extra = @() },
+    @{ t = 'ed25519'; f = 'ssh_host_ed25519_key'; extra = @() }
+)
+$hostKeyPaths = @()
+foreach ($hk in $hostKeyDefs) {
+    $kp = Join-Path $sshDir $hk.f
+    $need = $true
+    if (Test-Path $kp) { try { if ((Get-Item $kp).Length -gt 0) { $need = $false } } catch { } }
+    if ($need) {
+        Remove-Item $kp -Force -ErrorAction SilentlyContinue
+        $kgArgs = @('-t', $hk.t) + $hk.extra + @('-f', $kp, '-N', '""', '-q')
+        try { & $keygenExe @kgArgs 2>&1 | Out-Null } catch { }
+        if ((-not (Test-Path $kp)) -or ((Get-Item $kp).Length -eq 0)) {
+            # retry verbosely so the real error is visible instead of hidden
+            $kgArgs = @('-t', $hk.t) + $hk.extra + @('-f', $kp, '-N', '""')
+            try { & $keygenExe @kgArgs 2>&1 | ForEach-Object { Write-Host "      $_" -ForegroundColor DarkGray } } catch { }
+        }
+    }
+    if (Test-Path $kp) { $hostKeyPaths += $kp }
+}
+if ($hostKeyPaths.Count -eq 0) { Write-Err2 'OpenSSH Server : no host keys could be created - sshd cannot start' }
 
 # Windows sshd refuses to use host keys that any principal other than
 # SYSTEM/Administrators can touch ("UNPROTECTED PRIVATE KEY FILE" / "no hostkeys
@@ -236,6 +303,26 @@ function Set-SshdOption {
     Set-Content -LiteralPath $Config -Value $out -Encoding ASCII
 }
 
+function Set-SshdMultiOption {
+    # like Set-SshdOption but the directive is written several times (HostKey)
+    param([string]$Config, [string]$Name, [string[]]$Values)
+    if (-not $Values -or $Values.Count -eq 0) { return }
+    $esc = [regex]::Escape($Name)
+    $out = New-Object System.Collections.Generic.List[string]
+    $inserted = $false
+    $inMatch  = $false
+    foreach ($l in (Get-Content -LiteralPath $Config)) {
+        if ($l -match '^\s*Match\s') {
+            if (-not $inserted) { foreach ($v in $Values) { $out.Add("$Name $v") }; $inserted = $true }
+            $inMatch = $true
+        }
+        if (-not $inMatch -and $l -match ("^\s*#?\s*" + $esc + "(\s|$)")) { continue }
+        $out.Add($l)
+    }
+    if (-not $inserted) { foreach ($v in $Values) { $out.Add("$Name $v") } }
+    Set-Content -LiteralPath $Config -Value $out -Encoding ASCII
+}
+
 Set-SshdOption -Config $sshdConfig -Name 'Port'                  -Value $SshPort
 Set-SshdOption -Config $sshdConfig -Name 'PasswordAuthentication' -Value 'yes'
 Set-SshdOption -Config $sshdConfig -Name 'PubkeyAuthentication'   -Value 'yes'
@@ -250,6 +337,8 @@ Set-SshdOption -Config $sshdConfig -Name 'SyslogFacility'         -Value 'LOCAL0
 Set-SshdOption -Config $sshdConfig -Name 'LogLevel'               -Value 'DEBUG2'
 Set-SshdOption -Config $sshdConfig -Name 'MaxStartups'            -Value '100:30:200'
 Set-SshdOption -Config $sshdConfig -Name 'MaxSessions'            -Value '100'
+# explicit host keys (absolute paths) so sshd never has to guess where they are
+Set-SshdMultiOption -Config $sshdConfig -Name 'HostKey' -Values $hostKeyPaths
 
 # Keep authorised keys in a fixed, per-user location under ProgramData instead of
 # the user profile ("%USERPROFILE%\.ssh") - the profile of a fresh local account
@@ -271,14 +360,55 @@ Set-SshdOption -Config $sshdConfig -Name 'AuthorizedKeysFile' -Value '__PROGRAMD
 Write-Ok "OpenSSH Server : per-user keys -> $akDir\%u"
 Write-Ok "OpenSSH Server : sshd_config configured (port $SshPort, password auth on)"
 
-try { $cfgTest = & (Join-Path $OpenSshDir 'sshd.exe') -t -f $sshdConfig 2>&1 } catch { $cfgTest = $_.Exception.Message }
+try { $cfgTest = & $sshdExe -t -f $sshdConfig 2>&1 } catch { $cfgTest = $_.Exception.Message }
 if ($cfgTest) { Write-Warn2 "sshd -t : $cfgTest" } else { Write-Ok 'sshd -t : config OK' }
 
-try {
-    Restart-Service sshd -Force -ErrorAction Stop
-    if ((Get-Service sshd).Status -ne 'Running') { Start-Service sshd }
+function Start-SshdService {
+    # (re)start the service and wait until it actually reaches "Running"
+    try { Restart-Service sshd -Force -ErrorAction Stop } catch { }
+    for ($i = 0; $i -lt 12; $i++) {
+        $s = Get-Service sshd -ErrorAction SilentlyContinue
+        if ($s -and $s.Status -eq 'Running') { return $true }
+        Start-Sleep -Milliseconds 500
+    }
+    try { Start-Service sshd -ErrorAction Stop } catch { }
+    Start-Sleep -Milliseconds 800
+    return ((Get-Service sshd -ErrorAction SilentlyContinue).Status -eq 'Running')
+}
+function Show-SshdDiagnostics {
+    Write-Warn2 'OpenSSH Server : sshd failed to start - collecting the real reason'
+    try { & sc.exe qc sshd 2>&1 | ForEach-Object { Write-Host "      $_" -ForegroundColor DarkGray } } catch { }
+    # run sshd in debug mode in the foreground to capture the exact error
+    # (bind failure, unreadable host key, bad config, ...) then kill it
+    $out = Join-Path $env:TEMP 'ssh443-sshd-out.txt'
+    $err = Join-Path $env:TEMP 'ssh443-sshd-err.txt'
+    Remove-Item $out, $err -Force -ErrorAction SilentlyContinue
+    try {
+        $proc = Start-Process -FilePath $sshdExe -ArgumentList @('-d', '-f', "`"$sshdConfig`"") -RedirectStandardOutput $out -RedirectStandardError $err -NoNewWindow -PassThru
+        Start-Sleep -Seconds 3
+        if ($proc -and -not $proc.HasExited) { try { $proc.Kill() } catch { }; Write-Ok 'sshd runs fine in debug mode (config and host keys are OK)' }
+        else { Write-Warn2 "sshd debug mode exited with code $($proc.ExitCode)" }
+    } catch { Write-Host "      diag: $($_.Exception.Message)" -ForegroundColor DarkGray }
+    foreach ($f in @($err, $out)) {
+        if (Test-Path $f) { Get-Content $f -ErrorAction SilentlyContinue | Select-Object -Last 20 | ForEach-Object { Write-Host "      $_" -ForegroundColor DarkGray } }
+    }
+    $slog = Join-Path $sshDir 'logs\sshd.log'
+    if (Test-Path $slog) { Get-Content $slog -Tail 15 -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "      $_" -ForegroundColor DarkGray } }
+    try {
+        Get-WinEvent -LogName System -MaxEvents 60 -ErrorAction Stop |
+            Where-Object { $_.ProviderName -match 'Service Control Manager' -and $_.Message -match 'sshd|OpenSSH' } |
+            Select-Object -First 3 | ForEach-Object { Write-Host ('      ' + ($_.Message -replace '\s+', ' ')) -ForegroundColor DarkGray }
+    } catch { }
+}
+
+if (Start-SshdService) {
     Write-Ok "OpenSSH Server : running on port $SshPort"
-} catch { Write-Warn2 "OpenSSH Server : sshd did not start - $($_.Exception.Message)" }
+} else {
+    Show-SshdDiagnostics
+    Start-Sleep -Seconds 1
+    if (Start-SshdService) { Write-Ok "OpenSSH Server : running on port $SshPort (after the diagnostic run)" }
+    else { Write-Warn2 'OpenSSH Server : sshd is still not running - SSH logins will fail until it starts' }
+}
 
 # ------------------------------------------------------------------ 2. ssh banner
 Write-Step 'SSH banner : writing'
@@ -288,7 +418,7 @@ $Server_Message = $Server_Message.Replace('[C1]',[string][char]0x3164).Replace('
 $bannerFile = Join-Path $sshDir 'banner.txt'
 [System.IO.File]::WriteAllText($bannerFile, $Server_Message, (New-Object System.Text.UTF8Encoding($false)))
 Set-SshdOption -Config $sshdConfig -Name 'Banner' -Value $bannerFile
-Restart-Service sshd -Force -ErrorAction SilentlyContinue
+if (-not (Start-SshdService)) { Write-Warn2 'OpenSSH Server : sshd did not reload the banner (sshd not running)' }
 Write-Ok "SSH banner : $bannerFile"
 
 # ------------------------------------------------------------------ 3. user
