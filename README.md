@@ -6,6 +6,7 @@
 ```
 bash <(curl -s https://raw.githubusercontent.com/l-s-I-I/speed/main/Run.sh)
 ```
+
 # أو للويندوز (Windows) :-
 ### افتح **PowerShell كـ Administrator** وشغّل الأمر دي :-
 ```
