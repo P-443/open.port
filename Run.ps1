@@ -39,6 +39,8 @@ $RootDir    = Split-Path -Parent $MyInvocation.MyCommand.Path
 $WorkDir    = Join-Path $env:ProgramData 'ssh443'
 $LogFile    = Join-Path $WorkDir 'tunnel.log'
 $SetupLog   = Join-Path $WorkDir 'setup.log'
+# Windows build version - its own counter, bumped on every change (1.0 -> 1.1 -> ...)
+$WinVer     = '1.0'
 
 function Write-Step   ($m) { Write-Host "  [*] $m" -ForegroundColor Cyan }
 function Write-Ok     ($m) { Write-Host "  [v] $m" -ForegroundColor Green }
@@ -50,7 +52,9 @@ $line = '#' * 74
 Write-Host ""
 Write-Host $line -ForegroundColor Green
 Write-Host "#        SSH over port 443 on Windows  ( no docker / no extra tools )       #" -ForegroundColor Red
-Write-Host "#                      Windows port of Run.sh  v1.5                        #" -ForegroundColor Green
+$hdrText = 'Windows port of Run.sh  v' + $WinVer
+$hdrLp   = [math]::Floor((74 - $hdrText.Length) / 2)
+Write-Host ('#' + (' ' * $hdrLp) + $hdrText + (' ' * (74 - $hdrText.Length - $hdrLp)) + '#') -ForegroundColor Green
 Write-Host $line -ForegroundColor Green
 Write-Host ""
 
@@ -505,6 +509,29 @@ Write-Ok 'TCP tuning applied'
 
 # ------------------------------------------------------------------ 7. scheduled task (auto start at boot)
 Write-Step "Service host : scheduled task '$TaskName'"
+
+# A previous install leaves its tunnel process running and holding <Port>.  The
+# task uses MultipleInstances=IgnoreNew, so Task Scheduler would REFUSE to start
+# the new instance and 443 would keep being served by the OLD process (with the
+# OLD target port) - the new settings would simply never take effect.  So stop
+# the task and kill whatever still holds the tunnel port before (re)registering.
+try { Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue } catch { }
+for ($i = 0; $i -lt 20; $i++) {
+    $l = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $l) { break }
+    $proc = Get-Process -Id $l.OwningProcess -ErrorAction SilentlyContinue
+    if ($proc -and $proc.ProcessName -match 'powershell|pwsh') {
+        Write-Warn2 "stopping the previous tunnel process $($proc.ProcessName) (pid $($proc.Id)) on port $Port"
+        try { Stop-Process -Id $proc.Id -Force -ErrorAction Stop } catch { }
+        Start-Sleep -Milliseconds 500
+    } else {
+        Write-Warn2 "port $Port is held by '$($proc.ProcessName)' (pid $($proc.Id)) - it will have to be stopped manually"
+        break
+    }
+}
+# start from a clean log so the verification step below reflects THIS run only
+if (Test-Path $LogFile) { Remove-Item $LogFile -Force -ErrorAction SilentlyContinue }
+
 $tunnelPs = Join-Path $RootDir 'Tunnel443.ps1'
 $argList = @(
     '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden',
@@ -533,17 +560,23 @@ try {
 # ------------------------------------------------------------------ 8. verify
 Write-Step 'Verifying listener ...'
 $ok = $false
-for ($i = 0; $i -lt 15; $i++) {
+for ($i = 0; $i -lt 20; $i++) {
     Start-Sleep -Seconds 1
-    $l = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue
+    $l = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($l) { $ok = $true; break }
 }
-if ($ok) {
-    $owner = (Get-Process -Id $l[0].OwningProcess -ErrorAction SilentlyContinue).ProcessName
-    Write-Ok "Listening on port $Port (process: $owner)"
+# the tunnel logs "tcp listen" only once it really bound the port, so a leftover
+# process sitting on the port can no longer make this step look successful
+$bindOk = $false
+if (Test-Path $LogFile) {
+    $bindOk = [bool](Get-Content $LogFile -ErrorAction SilentlyContinue | Where-Object { $_ -match 'tcp listen' })
+}
+if ($ok -and $bindOk) {
+    $owner = (Get-Process -Id $l.OwningProcess -ErrorAction SilentlyContinue).ProcessName
+    Write-Ok "Listening on port $Port (process: $owner)  ->  127.0.0.1:$SshPort"
 } else {
-    Write-Err2 "Nothing is listening on port $Port - check $LogFile"
-    if (Test-Path $LogFile) { Get-Content $LogFile -Tail 15 | ForEach-Object { Write-Host "      $_" -ForegroundColor DarkGray } }
+    Write-Err2 "tunnel did not come up on port $Port - check $LogFile"
+    if (Test-Path $LogFile) { Get-Content $LogFile -Tail 20 | ForEach-Object { Write-Host "      $_" -ForegroundColor DarkGray } }
 }
 
 # ------------------------------------------------------------------ 9. public info
@@ -583,7 +616,7 @@ Write-Host '  ========== Http Custom ==========' -ForegroundColor Green
 Write-Host ("  {0}:{1}@{2}:{3} {4} {5}" -f $ip, $Port, $userName, $Pass, $chArrow, $flag) -ForegroundColor Yellow
 Write-Host '  ------------------------------------------------------------------'
 Write-Host '  # DEV:- l_s_I_I.T.ME' -ForegroundColor DarkGray
-Write-Host ("  # Script V ==> 1.5 {0}" -f $chCheck) -ForegroundColor Green
+Write-Host ("  # Script V ==> {0} {1}" -f $WinVer, $chCheck) -ForegroundColor Green
 Write-Host '  ------------------------------------------------------------------'
 Write-Host '  Client settings:  SSH + TLS / SNI  (self-signed OK)'
 Write-Host '  Files          :  ' -NoNewline; Write-Host $RootDir
