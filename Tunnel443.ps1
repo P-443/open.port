@@ -679,9 +679,23 @@ if ($UdpGwPort -gt 0 -and [string]::IsNullOrWhiteSpace($UdpGwDns)) {
 
 # ================================================================== start
 [Ssh443.Log]::Write("===== tunnel start  (pid $PID) =====")
-[Ssh443.Tunnel]::Start($CertThumbprint, $TargetHost, $TargetPort, $Port, $LogFile, (-not $NoAutoDetect), $PeekMs)
+try {
+    [Ssh443.Tunnel]::Start($CertThumbprint, $TargetHost, $TargetPort, $Port, $LogFile, (-not $NoAutoDetect), $PeekMs)
+} catch {
+    [Ssh443.Log]::Write("FATAL       : cannot listen on port $Port -> $($_.Exception.Message)")
+    Write-Host ''
+    Write-Host "  [x] cannot listen on TCP $Port - $($_.Exception.Message)" -ForegroundColor Red
+    Write-Host "      another program is already using the port; stop it and start again." -ForegroundColor DarkGray
+    Write-Host "      log: $LogFile"
+    exit 1
+}
 [Ssh443.UdpGw]::Verbose = [bool]$UdpGwVerbose
-if ($UdpGwPort -gt 0) { [Ssh443.UdpGw]::Start($UdpGwBind, $UdpGwPort, $UdpGwDns) }
+try {
+    if ($UdpGwPort -gt 0) { [Ssh443.UdpGw]::Start($UdpGwBind, $UdpGwPort, $UdpGwDns) }
+} catch {
+    [Ssh443.Log]::Write("FATAL       : cannot start the UDP gateway on $UdpGwBind`:$UdpGwPort -> $($_.Exception.Message)")
+    Write-Host "  [!] UDP gateway failed on $UdpGwBind`:$UdpGwPort - $($_.Exception.Message)" -ForegroundColor Yellow
+}
 
 Write-Host ''
 Write-Host "  SSH-over-$Port tunnel is running." -ForegroundColor Green
