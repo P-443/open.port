@@ -30,6 +30,10 @@ param(
 
 $ErrorActionPreference = 'Stop'
 try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch { }
+# outbound HTTPS (ipinfo / github) needs TLS 1.2 on older images, and the
+# progress bar makes Invoke-WebRequest crawl
+try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch { }
+$ProgressPreference = 'SilentlyContinue'
 $TaskName   = 'SSH443-Tunnel'
 $RootDir    = Split-Path -Parent $MyInvocation.MyCommand.Path
 $WorkDir    = Join-Path $env:ProgramData 'ssh443'
@@ -75,19 +79,103 @@ Write-Host ""
 
 # ------------------------------------------------------------------ 1. OpenSSH server
 Write-Step 'OpenSSH Server : checking'
-$cap = Get-WindowsCapability -Online -Name 'OpenSSH.Server*' -ErrorAction SilentlyContinue | Select-Object -First 1
-if (-not $cap -or $cap.State -ne 'Installed') {
-    Write-Step 'OpenSSH Server : installing (built-in Windows feature)'
-    Add-WindowsCapability -Online -Name 'OpenSSH.Server~~~~0.0.1.0' | Out-Null
+
+# --- helpers -------------------------------------------------------------
+# A fresh or "tweaked" Windows VPS often has the Windows Update / Windows
+# Modules Installer service set to Disabled.  Get-WindowsCapability then fails
+# with 0x80070422 ("The service cannot be started ... it is disabled") even
+# though it is only a *query*.  Because $ErrorActionPreference is 'Stop' that
+# used to kill the whole script on the very first step.  So everything below:
+#   * short-circuits when OpenSSH is already on disk,
+#   * wraps every DISM call in try/catch so it can never abort the script,
+#   * repairs the servicing services and retries once,
+#   * and, as a last resort, installs the official Win32-OpenSSH package
+#     (that path does not use DISM / Windows Update at all).
+function Test-SshdPresent {
+    (Test-Path (Join-Path $env:WINDIR 'System32\OpenSSH\sshd.exe')) -or
+    (Test-Path (Join-Path $env:ProgramFiles 'OpenSSH\sshd.exe'))
 }
-Set-Service -Name sshd -StartupType Automatic
+function Get-SshdDir {
+    if (Test-Path (Join-Path $env:WINDIR 'System32\OpenSSH\sshd.exe')) { return (Join-Path $env:WINDIR 'System32\OpenSSH') }
+    if (Test-Path (Join-Path $env:ProgramFiles 'OpenSSH\sshd.exe'))     { return (Join-Path $env:ProgramFiles 'OpenSSH') }
+    return (Join-Path $env:WINDIR 'System32\OpenSSH')
+}
+function Repair-ServicingServices {
+    foreach ($n in 'wuauserv', 'TrustedInstaller', 'msiserver', 'UsoSvc', 'BITS') {
+        try {
+            $svc = Get-Service -Name $n -ErrorAction Stop
+            if ($svc.StartType -eq 'Disabled') {
+                Write-Warn2 "servicing service '$n' is Disabled -> switching it to Manual"
+                Set-Service -Name $n -StartupType Manual -ErrorAction Stop
+            }
+        } catch { }
+    }
+}
+function Add-OpenSshCapability {
+    try {
+        $cap = Get-WindowsCapability -Online -Name 'OpenSSH.Server*' -ErrorAction Stop | Select-Object -First 1
+        if ($cap -and $cap.State -eq 'Installed') { return $true }
+        Write-Step 'OpenSSH Server : installing (Windows capability)'
+        Add-WindowsCapability -Online -Name 'OpenSSH.Server~~~~0.0.1.0' -ErrorAction Stop | Out-Null
+        return (Test-SshdPresent)
+    } catch {
+        Write-Warn2 "OpenSSH Server : capability path failed - $($_.Exception.Message)"
+        return $false
+    }
+}
+function Install-OpenSshFromGitHub {
+    try {
+        Write-Step 'OpenSSH Server : downloading the official Win32-OpenSSH package'
+        $rel   = Invoke-RestMethod -Uri 'https://api.github.com/repos/PowerShell/Win32-OpenSSH/releases/latest' -TimeoutSec 30 -UseBasicParsing
+        $asset = $rel.assets | Where-Object { $_.name -eq 'OpenSSH-Win64.zip' } | Select-Object -First 1
+        if (-not $asset) { Write-Warn2 'OpenSSH Server : release asset not found'; return $false }
+        $zip = Join-Path $env:TEMP 'OpenSSH-Win64.zip'
+        Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $zip -UseBasicParsing -TimeoutSec 180
+        Expand-Archive -Path $zip -DestinationPath $env:TEMP -Force
+        $dst = Join-Path $env:ProgramFiles 'OpenSSH'
+        Remove-Item $dst -Recurse -Force -ErrorAction SilentlyContinue
+        Move-Item (Join-Path $env:TEMP 'OpenSSH-Win64') $dst -Force
+        $install = Join-Path $dst 'install-sshd.ps1'
+        if (Test-Path $install) { & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $install | Out-Null }
+        $keygen = Join-Path $dst 'ssh-keygen.exe'
+        if (Test-Path $keygen) { & $keygen -A | Out-Null }
+        if (-not (Get-Service sshd -ErrorAction SilentlyContinue)) {
+            New-Service -Name sshd -BinaryPathName "`"$dst\sshd.exe`"" -DisplayName 'OpenSSH SSH Server' -StartupType Automatic | Out-Null
+        }
+        Set-Service -Name sshd -StartupType Automatic -ErrorAction SilentlyContinue
+        return (Test-SshdPresent)
+    } catch {
+        Write-Warn2 "OpenSSH Server : Win32-OpenSSH fallback failed - $($_.Exception.Message)"
+        return $false
+    }
+}
+
+if (-not (Test-SshdPresent)) {
+    [void](Add-OpenSshCapability)
+    if (-not (Test-SshdPresent)) {
+        Write-Warn2 'OpenSSH Server : repairing the servicing services then retrying'
+        Repair-ServicingServices
+        Start-Service wuauserv -ErrorAction SilentlyContinue
+        [void](Add-OpenSshCapability)
+    }
+    if (-not (Test-SshdPresent)) { [void](Install-OpenSshFromGitHub) }
+}
+
+if (-not (Test-SshdPresent)) {
+    Write-Err2 'OpenSSH Server could not be installed automatically.'
+    Write-Err2 'Enable it manually (Settings > Optional Features > OpenSSH Server), then re-run this script.'
+    exit 1
+}
+$OpenSshDir = Get-SshdDir
+try { Set-Service -Name sshd -StartupType Automatic -ErrorAction Stop } catch { }
+Write-Ok "OpenSSH Server : binaries -> $OpenSshDir"
 $sshDir = Join-Path $env:ProgramData 'ssh'
 if (-not (Test-Path $sshDir)) { New-Item -ItemType Directory -Force -Path $sshDir | Out-Null }
 
 # host keys
 if (-not (Test-Path (Join-Path $sshDir 'ssh_host_rsa_key'))) {
     Write-Step 'OpenSSH Server : generating host keys'
-    & (Join-Path $env:WINDIR 'System32\OpenSSH\ssh-keygen.exe') -A | Out-Null
+    & (Join-Path $OpenSshDir 'ssh-keygen.exe') -A | Out-Null
 }
 
 # Windows sshd refuses to use host keys that any principal other than
@@ -114,7 +202,16 @@ Write-Ok 'OpenSSH Server : host key permissions secured'
 
 $sshdConfig = Join-Path $sshDir 'sshd_config'
 if (-not (Test-Path $sshdConfig)) {
-    Copy-Item (Join-Path $env:WINDIR 'System32\OpenSSH\sshd_config_default') $sshdConfig -Force
+    $def = Join-Path $OpenSshDir 'sshd_config_default'
+    if (Test-Path $def) {
+        Copy-Item $def $sshdConfig -Force
+    } else {
+        # minimal template; Set-SshdOption fills in everything else below
+        Set-Content -LiteralPath $sshdConfig -Encoding ASCII -Value @(
+            '# generated by Run.ps1',
+            'Subsystem sftp sftp-server.exe'
+        )
+    }
     Write-Step "OpenSSH Server : created $sshdConfig"
 }
 
@@ -174,12 +271,14 @@ Set-SshdOption -Config $sshdConfig -Name 'AuthorizedKeysFile' -Value '__PROGRAMD
 Write-Ok "OpenSSH Server : per-user keys -> $akDir\%u"
 Write-Ok "OpenSSH Server : sshd_config configured (port $SshPort, password auth on)"
 
-try { $cfgTest = & (Join-Path $env:WINDIR 'System32\OpenSSH\sshd.exe') -t -f $sshdConfig 2>&1 } catch { $cfgTest = $_.Exception.Message }
+try { $cfgTest = & (Join-Path $OpenSshDir 'sshd.exe') -t -f $sshdConfig 2>&1 } catch { $cfgTest = $_.Exception.Message }
 if ($cfgTest) { Write-Warn2 "sshd -t : $cfgTest" } else { Write-Ok 'sshd -t : config OK' }
 
-Restart-Service sshd -Force -ErrorAction SilentlyContinue
-if ((Get-Service sshd).Status -ne 'Running') { Start-Service sshd }
-Write-Ok "OpenSSH Server : running on port $SshPort"
+try {
+    Restart-Service sshd -Force -ErrorAction Stop
+    if ((Get-Service sshd).Status -ne 'Running') { Start-Service sshd }
+    Write-Ok "OpenSSH Server : running on port $SshPort"
+} catch { Write-Warn2 "OpenSSH Server : sshd did not start - $($_.Exception.Message)" }
 
 # ------------------------------------------------------------------ 2. ssh banner
 Write-Step 'SSH banner : writing'
@@ -226,30 +325,37 @@ Write-Ok "User $userName ready (password auth)"
 
 # ------------------------------------------------------------------ 4. firewall
 Write-Step 'Firewall : opening ports'
-foreach ($p in @($Port)) {
-    if (-not (Get-NetFirewallRule -DisplayName "SSH443-Tunnel-$p" -ErrorAction SilentlyContinue)) {
-        New-NetFirewallRule -DisplayName "SSH443-Tunnel-$p" -Direction Inbound -Action Allow `
-            -Protocol TCP -LocalPort $p -Profile Any | Out-Null
+try {
+    foreach ($p in @($Port)) {
+        if (-not (Get-NetFirewallRule -DisplayName "SSH443-Tunnel-$p" -ErrorAction SilentlyContinue)) {
+            New-NetFirewallRule -DisplayName "SSH443-Tunnel-$p" -Direction Inbound -Action Allow `
+                -Protocol TCP -LocalPort $p -Profile Any -ErrorAction Stop | Out-Null
+        }
     }
-}
-if (-not (Get-NetFirewallRule -DisplayName 'OpenSSH-Server-In-TCP' -ErrorAction SilentlyContinue)) {
-    New-NetFirewallRule -DisplayName 'OpenSSH-Server-In-TCP' -Direction Inbound -Action Allow `
-        -Protocol TCP -LocalPort $SshPort -Profile Any | Out-Null
-} else {
-    Set-NetFirewallRule -DisplayName 'OpenSSH-Server-In-TCP' -Enabled True -Profile Any | Out-Null
-}
-Write-Ok "Firewall : TCP $Port open  (+ SSH $SshPort)"
+    if (-not (Get-NetFirewallRule -DisplayName 'OpenSSH-Server-In-TCP' -ErrorAction SilentlyContinue)) {
+        New-NetFirewallRule -DisplayName 'OpenSSH-Server-In-TCP' -Direction Inbound -Action Allow `
+            -Protocol TCP -LocalPort $SshPort -Profile Any -ErrorAction Stop | Out-Null
+    } else {
+        Set-NetFirewallRule -DisplayName 'OpenSSH-Server-In-TCP' -Enabled True -Profile Any -ErrorAction Stop | Out-Null
+    }
+    Write-Ok "Firewall : TCP $Port open  (+ SSH $SshPort)"
+} catch { Write-Warn2 "Firewall rule not created - $($_.Exception.Message)" }
 
 # ------------------------------------------------------------------ 5. certificate
 Write-Step 'Certificate : self-signed TLS'
 $cert = Get-ChildItem Cert:\LocalMachine\My | Where-Object { $_.Subject -eq $CertSubject } |
         Sort-Object NotAfter -Descending | Select-Object -First 1
 if (-not $cert -or $cert.NotAfter -lt (Get-Date).AddDays(30)) {
-    $cert = New-SelfSignedCertificate -DnsName $SniHost, 'localhost', 'www.microsoft.com' `
-        -Subject $CertSubject -CertStoreLocation Cert:\LocalMachine\My `
-        -NotAfter (Get-Date).AddYears(10) -KeyAlgorithm RSA -KeyLength 2048 `
-        -HashAlgorithm SHA256 -KeyExportPolicy Exportable -Type SSLServerAuthentication
-    Write-Ok "Certificate created : $($cert.Thumbprint)"
+    try {
+        $cert = New-SelfSignedCertificate -DnsName $SniHost, 'localhost', 'www.microsoft.com' `
+            -Subject $CertSubject -CertStoreLocation Cert:\LocalMachine\My `
+            -NotAfter (Get-Date).AddYears(10) -KeyAlgorithm RSA -KeyLength 2048 `
+            -HashAlgorithm SHA256 -KeyExportPolicy Exportable -Type SSLServerAuthentication -ErrorAction Stop
+        Write-Ok "Certificate created : $($cert.Thumbprint)"
+    } catch {
+        Write-Err2 "Certificate creation failed : $($_.Exception.Message)"
+        exit 1
+    }
 } else {
     Write-Ok "Certificate reused  : $($cert.Thumbprint)"
 }
@@ -284,10 +390,15 @@ $settings  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGo
                 -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) `
                 -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew
 
-Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger `
-    -Principal $principal -Settings $settings -Force | Out-Null
-Start-ScheduledTask -TaskName $TaskName
-Write-Ok "Task registered and started (auto-start at boot, run as SYSTEM)"
+try {
+    Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger `
+        -Principal $principal -Settings $settings -Force -ErrorAction Stop | Out-Null
+    Start-ScheduledTask -TaskName $TaskName -ErrorAction Stop
+    Write-Ok "Task registered and started (auto-start at boot, run as SYSTEM)"
+} catch {
+    Write-Err2 "Could not register the scheduled task : $($_.Exception.Message)"
+    exit 1
+}
 
 # ------------------------------------------------------------------ 8. verify
 Write-Step 'Verifying listener ...'
