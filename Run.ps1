@@ -40,7 +40,7 @@ $WorkDir    = Join-Path $env:ProgramData 'ssh443'
 $LogFile    = Join-Path $WorkDir 'tunnel.log'
 $SetupLog   = Join-Path $WorkDir 'setup.log'
 # Windows build version - its own counter, bumped on every change (1.0 -> 1.1 -> ...)
-$WinVer     = '1.1'
+$WinVer     = '1.2'
 
 function Write-Step   ($m) { Write-Host "  [*] $m" -ForegroundColor Cyan }
 function Write-Ok     ($m) { Write-Host "  [v] $m" -ForegroundColor Green }
@@ -328,12 +328,13 @@ function Set-SshdMultiOption {
 }
 
 function Remove-SshdOption {
-    # drop a directive (and its commented form) from sshd_config
+    # drop a directive (and its commented form) from sshd_config.
+    # NB: read into a variable first - piping Get-Content straight into
+    # Set-Content on the SAME file fails with "being used by another process".
     param([string]$Config, [string]$Name)
-    $esc = [regex]::Escape($Name)
-    Get-Content -LiteralPath $Config |
-        Where-Object { $_ -notmatch ("^\s*#?\s*" + $esc + "(\s|$)") } |
-        Set-Content -LiteralPath $Config -Encoding ASCII
+    $esc  = [regex]::Escape($Name)
+    $kept = @(Get-Content -LiteralPath $Config | Where-Object { $_ -notmatch ("^\s*#?\s*" + $esc + "(\s|$)") })
+    Set-Content -LiteralPath $Config -Value $kept -Encoding ASCII
 }
 
 Set-SshdOption -Config $sshdConfig -Name 'Port'                  -Value $SshPort
