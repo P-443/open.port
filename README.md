@@ -46,6 +46,7 @@ powershell -ExecutionPolicy Bypass -File .\Run.ps1 -User myuser -Pass 'MySecureP
 | `-SshPort` | `22` | Internal OpenSSH Server port |
 | `-UdpGwPort` | `7300` | Port for the badvpn-compatible UDP gateway (`0` to disable) |
 | `-SniHost` | `$User` | Domain name to include in the self-signed TLS certificate |
+| `-BindIp` | auto | Physical NIC IP to bind sshd + the 443 listener + UDP sockets to (auto-detected if omitted) |
 | `-NoUdpgw` | `False` | Switch to disable the UDP gateway completely |
 
 ---
@@ -54,7 +55,7 @@ powershell -ExecutionPolicy Bypass -File .\Run.ps1 -User myuser -Pass 'MySecureP
 
 | Setting | Value |
 |---|---|
-| **Host / IP** | Server IP address (or `127.0.0.1` if testing locally) |
+| **Host / IP** | Server IP address. On the **same PC** use the `Local NIC IP` printed by `Run.ps1` (e.g. `192.168.1.25`), **not** `127.0.0.1` and **not** the VPN/TUN address |
 | **Port** | `443` (or the port specified in `-Port`) |
 | **Protocol** | SSH |
 | **TLS / SSL** | **ON** (SNI: any domain, e.g. `telegram` or your chosen SNI) |
@@ -80,7 +81,23 @@ When you enable **TUN Mode** in NetMod:
 
 ### How to Fix It:
 
-#### Option 1: Use "System Proxy" Mode in NetMod (Recommended & Instant)
+#### Option 0 (v1.5+): The script pins the SSH service to the physical NIC - automatic
+`Run.ps1` now detects the real Wi-Fi/Ethernet card (it skips TAP/Wintun/NetMod/VPN/Hyper-V/WSL adapters) and:
+- writes `ListenAddress 127.0.0.1` + `ListenAddress <physical-IP>` into `sshd_config` (sshd never listens on the TUN adapter),
+- binds the TLS listener on port 443 to that same IP instead of `0.0.0.0`,
+- binds the outbound UDP-gateway sockets to that IP as well,
+- adds a persistent `/32` route so traffic to your own NIC IP always stays on the physical card,
+- prints the IP at the end. **Use that printed `Local NIC IP` as the Host in NetMod** (not `127.0.0.1`, not the TUN address).
+
+You can force a specific card with `-BindIp 192.168.1.25`. The value is stored in
+`C:\ProgramData\ssh443\primary-ip.txt` so the SYSTEM scheduled task uses it at boot.
+
+> Note: Windows still chooses the route for *outbound connections opened by `sshd.exe`*
+> by destination, not by process. The listener/bind fix above removes the listener-side
+> loop; if your VPN client still captures `sshd.exe`'s own upstream sockets, add the
+> process bypass below (Option 2) or use System Proxy (Option 1).
+
+#### Option 1: Use "System Proxy" Mode in NetMod (Instant)
 - Inside NetMod PC, switch the connection mode from **TUN Mode** to **System Proxy Mode**.
 - In System Proxy mode, NetMod exposes a local SOCKS5/HTTP proxy (usually `127.0.0.1:1080`) and sets Windows proxy settings without hijacking the network adapter default route.
 - `sshd.exe` connects out to the real internet directly through your physical Wi-Fi/Ethernet adapter without looping. Everything will load immediately.
