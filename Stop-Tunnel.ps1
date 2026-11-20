@@ -47,6 +47,20 @@ if (-not $Uninstall) { Say 'Done (tunnel stopped).' 'Green'; exit 0 }
 Say 'Removing scheduled task ...'
 Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
 
+# remove the pinned primary-NIC route and the saved IP used by Tunnel443.ps1
+$nicFile = Join-Path $WorkDir 'primary-ip.txt'
+if (Test-Path $nicFile) {
+    $bindIp = (Get-Content -LiteralPath $nicFile -TotalCount 1).Trim()
+    if ($bindIp -and $bindIp -ne '0.0.0.0') {
+        foreach ($store in 'PersistentStore', 'ActiveStore') {
+            Get-NetRoute -DestinationPrefix "$bindIp/32" -PolicyStore $store -ErrorAction SilentlyContinue |
+                Remove-NetRoute -PolicyStore $store -Confirm:$false -ErrorAction SilentlyContinue
+        }
+        Say "removed pinned route for $bindIp" 'Green'
+    }
+    Remove-Item $nicFile -Force -ErrorAction SilentlyContinue
+}
+
 Say 'Removing firewall rules ...'
 Get-NetFirewallRule -DisplayName 'SSH443-Tunnel-*' -ErrorAction SilentlyContinue | Remove-NetFirewallRule -ErrorAction SilentlyContinue
 
