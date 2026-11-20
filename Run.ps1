@@ -10,10 +10,18 @@
       2. creates the SSH user / password
       3. adds an SSH banner
       4. creates a self-signed certificate
-      5. starts a TLS listener on <Port> that forwards to 127.0.0.1:<SshPort>
-      6. starts a badvpn-compatible UDP gateway on 127.0.0.1:<UdpGwPort> (UDP over the tunnel)
-      7. adds firewall rules, registers a start-up scheduled task, tunes TCP
+      5. detects the physical (primary) NIC and binds sshd + the TLS listener to it
+      6. starts a TLS listener on <Port> that forwards to 127.0.0.1:<SshPort>
+      7. starts a badvpn-compatible UDP gateway on 127.0.0.1:<UdpGwPort> (UDP over the tunnel)
+      8. adds firewall rules, registers a start-up scheduled task, tunes TCP
     Must be run as Administrator.
+
+    Why the primary NIC binding matters (NetMod / any TUN-mode VPN on the same PC):
+    a TUN adapter rewrites 0.0.0.0/0. If sshd and the TLS listener sit on 0.0.0.0,
+    the VPN captures their packets and feeds them straight back into the tunnel ->
+    infinite loop and "connected but no internet". By listening only on the real
+    card (plus 127.0.0.1 for the local TLS -> SSH hop), the TUN adapter is never a
+    listener and the client always reaches the server through the physical card.
 #>
 
 [CmdletBinding()]
@@ -25,7 +33,8 @@ param(
     [int]    $UdpGwPort    = 7300,
     [switch] $NoUdpgw,
     [string] $SniHost      = '',
-    [string] $CertSubject  = 'CN=ssh443-tunnel'
+    [string] $CertSubject  = 'CN=ssh443-tunnel',
+    [string] $BindIp       = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -40,7 +49,7 @@ $WorkDir    = Join-Path $env:ProgramData 'ssh443'
 $LogFile    = Join-Path $WorkDir 'tunnel.log'
 $SetupLog   = Join-Path $WorkDir 'setup.log'
 # Windows build version - its own counter, bumped on every change (1.0 -> 1.1 -> ...)
-$WinVer     = '1.4'
+$WinVer     = '1.5'
 
 function Write-Step   ($m) { Write-Host "  [*] $m" -ForegroundColor Cyan }
 function Write-Ok     ($m) { Write-Host "  [v] $m" -ForegroundColor Green }
@@ -74,6 +83,70 @@ if ($Port -le 0) {
 }
 if (-not $SniHost) { $SniHost = $User }
 if ($NoUdpgw) { $UdpGwPort = 0 }
+
+# ------------------------------------------------------------------ primary NIC
+# The SSH service must live on the real internet card, never on a VPN/TUN adapter.
+function Get-PrimaryNic {
+    $virtualPattern = '(?i)(TAP|Wintun|NetMod|VPN|Tunnel|Virtual|Hyper-V|vEthernet|VMware|VirtualBox|WSL|WireGuard|OpenVPN|Loopback|WAN Miniport)'
+    $cands = @(Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object {
+        $_.IPAddress -notlike '127.*' -and
+        $_.IPAddress -notlike '169.254.*' -and
+        $_.PrefixLength -gt 0 -and
+        $_.InterfaceAlias -notmatch $virtualPattern
+    })
+    if ($cands.Count -eq 0) { return $null }
+    $routes = @(Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue |
+                Where-Object { $_.NextHop -and $_.NextHop -ne '0.0.0.0' -and $_.InterfaceIndex -gt 0 })
+    $best = $null; $bestScore = [int]::MaxValue
+    foreach ($c in $cands) {
+        $r = $routes | Where-Object { $_.InterfaceIndex -eq $c.InterfaceIndex } | Sort-Object RouteMetric | Select-Object -First 1
+        $score = if ($r) { [int]$r.RouteMetric } else { 1000 }
+        $adapter = Get-NetAdapter -InterfaceIndex $c.InterfaceIndex -ErrorAction SilentlyContinue
+        if ($adapter -and $adapter.Status -ne 'Up') { $score += 5000 }
+        if ($score -lt $bestScore) {
+            $bestScore = $score
+            $best = [pscustomobject]@{
+                IP    = $c.IPAddress
+                Index = $c.InterfaceIndex
+                Alias = $c.InterfaceAlias
+                GW    = $(if ($r) { $r.NextHop } else { '' })
+            }
+        }
+    }
+    return $best
+}
+
+if ($BindIp) {
+    $a = Get-NetIPAddress -AddressFamily IPv4 -IPAddress $BindIp -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($a) {
+        $primaryNic = [pscustomobject]@{ IP = $BindIp; Index = $a.InterfaceIndex; Alias = $a.InterfaceAlias; GW = '' }
+    } else {
+        Write-Warn2 "BindIp $BindIp was not found on a local adapter - binding anyway"
+        $primaryNic = [pscustomobject]@{ IP = $BindIp; Index = 0; Alias = ''; GW = '' }
+    }
+} else {
+    $primaryNic = Get-PrimaryNic
+}
+if (-not $primaryNic) {
+    Write-Warn2 'No physical NIC detected - falling back to 0.0.0.0 (TUN loop protection disabled)'
+    $primaryNic = [pscustomobject]@{ IP = '0.0.0.0'; Index = 0; Alias = ''; GW = '' }
+}
+$BindIp = $primaryNic.IP
+Write-Ok "Primary NIC : $($primaryNic.Alias)  $BindIp  (ifIndex $($primaryNic.Index), gw $($primaryNic.GW))"
+
+# Tunnel443.ps1 runs as SYSTEM at boot, so persist the choice next to its log.
+$nicFile = Join-Path $WorkDir 'primary-ip.txt'
+Set-Content -LiteralPath $nicFile -Value $BindIp -Encoding ASCII
+
+if ($primaryNic.Index -gt 0) {
+    try {
+        # longest-prefix match makes /32 beat any VPN default route, so traffic
+        # aimed at our own NIC IP stays on the physical card even with TUN up.
+        New-NetRoute -DestinationPrefix "$BindIp/32" -InterfaceIndex $primaryNic.Index `
+            -RouteMetric 1 -PolicyStore PersistentStore -ErrorAction Stop | Out-Null
+        Write-Ok "Route pinned : $BindIp/32 -> interface $($primaryNic.Index)"
+    } catch { Write-Warn2 "could not pin $BindIp/32 route : $($_.Exception.Message)" }
+}
 
 Write-Host ""
 Write-Host "  ------------------------------------------------------------------"
@@ -347,6 +420,13 @@ Set-SshdOption -Config $sshdConfig -Name 'PermitTunnel'               -Value 'ye
 Set-SshdOption -Config $sshdConfig -Name 'AllowStreamLocalForwarding' -Value 'yes'
 Set-SshdOption -Config $sshdConfig -Name 'DisableForwarding'          -Value 'no'
 Set-SshdOption -Config $sshdConfig -Name 'TCPKeepAlive'               -Value 'yes'
+# Listen ONLY on loopback (the local TLS -> SSH hop) and the physical NIC.
+# A listener on the VPN/TUN adapter is what creates the recursive routing loop.
+if ($BindIp -and $BindIp -ne '0.0.0.0') {
+    Set-SshdMultiOption -Config $sshdConfig -Name 'ListenAddress' -Values @('127.0.0.1', $BindIp)
+} else {
+    Remove-SshdOption -Config $sshdConfig -Name 'ListenAddress'
+}
 Set-SshdOption -Config $sshdConfig -Name 'ClientAliveInterval'        -Value '30'
 Set-SshdOption -Config $sshdConfig -Name 'ClientAliveCountMax'        -Value '6'
 # readable sshd log next to the tunnel log (default would go to the event log only)
@@ -594,7 +674,8 @@ $argList = @(
     '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden',
     '-File', "`"$tunnelPs`"",
     '-Port', $Port, '-TargetPort', $SshPort, '-CertSubject', "`"$CertSubject`"",
-    '-UdpGwPort', $UdpGwPort, '-LogFile', "`"$LogFile`"", '-SniHost', "`"$SniHost`""
+    '-UdpGwPort', $UdpGwPort, '-LogFile', "`"$LogFile`"", '-SniHost', "`"$SniHost`"",
+    '-BindIp', "`"$BindIp`""
 ) -join ' '
 
 $action    = New-ScheduledTaskAction -Execute (Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe') -Argument $argList
@@ -630,7 +711,7 @@ if (Test-Path $LogFile) {
 }
 if ($ok -and $bindOk) {
     $owner = (Get-Process -Id $l.OwningProcess -ErrorAction SilentlyContinue).ProcessName
-    Write-Ok "Listening on port $Port (process: $owner)  ->  127.0.0.1:$SshPort"
+    Write-Ok "Listening on $BindIp`:$Port (process: $owner)  ->  127.0.0.1:$SshPort"
 } else {
     Write-Err2 "tunnel did not come up on port $Port - check $LogFile"
     if (Test-Path $LogFile) { Get-Content $LogFile -Tail 20 | ForEach-Object { Write-Host "      $_" -ForegroundColor DarkGray } }
@@ -665,6 +746,7 @@ Write-Host '  ========== SSH Account ==========' -ForegroundColor Green
 Write-Host ("  {0} CHANNEL URL:- D_S_D_C1.T.ME" -f $chBullet) -ForegroundColor Yellow
 Write-Host ("  {0} VPS Country:- {1}" -f $chBullet, $countryLabel) -ForegroundColor Yellow
 Write-Host ("  {0} IP Address:- {1}" -f $chBullet, $ip) -ForegroundColor Yellow
+Write-Host ("  {0} Local NIC IP:- {1}  (use this in NetMod on the same PC)" -f $chBullet, $BindIp) -ForegroundColor Yellow
 Write-Host ("  {0} port:- {1}" -f $chBullet, $Port) -ForegroundColor Yellow
 Write-Host ("  {0} User:- {1}" -f $chBullet, $userName) -ForegroundColor Yellow
 Write-Host ("  {0} Pass:- {1}" -f $chBullet, $Pass) -ForegroundColor Yellow
@@ -676,7 +758,8 @@ Write-Host '  # DEV:- l_s_I_I.T.ME' -ForegroundColor DarkGray
 Write-Host ("  # Script V ==> {0} {1}" -f $WinVer, $chCheck) -ForegroundColor Green
 Write-Host '  ------------------------------------------------------------------'
 Write-Host '  Client settings:  SSH + TLS / SNI  (self-signed OK)'
-Write-Host '  Localhost / NetMod tip: Use "System Proxy" mode on same PC to avoid TUN loop' -ForegroundColor Cyan
+Write-Host ("  NetMod Host/IP : {0}  (physical NIC - NOT 127.0.0.1, NOT the TUN address)" -f $BindIp) -ForegroundColor Cyan
+Write-Host '  NetMod mode    : TUN/VPN is fine now - the SSH service is not listening on the TUN adapter' -ForegroundColor Cyan
 Write-Host '  Files          :  ' -NoNewline; Write-Host $RootDir
 Write-Host '  Log            :  ' -NoNewline; Write-Host $LogFile
 Write-Host '  Stop           :  ' -NoNewline; Write-Host ("powershell -File `"{0}`"" -f (Join-Path $RootDir 'Stop-Tunnel.ps1'))
