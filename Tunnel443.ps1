@@ -251,6 +251,11 @@ namespace Ssh443
                 back.Connect(TargetHost, TargetPort);
                 Stream server = new NetworkStream(back, false);
 
+                // Connecting to 127.0.0.1:22 makes OpenSSH spawn a NEW sshd child
+                // for this session. Pin it to the physical NIC right now, before
+                // it can open the first SOCKS/direct-tcpip socket via the TUN.
+                BindNic.InjectAllNow();
+
                 Log.Write("open        : " + peer + "  " + (tls ? "TLS" : "TCP"));
 
                 Stream[] from = new Stream[] { client, server };
@@ -764,6 +769,15 @@ namespace Ssh443
         }
 
         public static void StopKeeper() { _stop = true; }
+
+        // Called from the connection-accept path: a fresh sshd child is spawned
+        // at that exact moment, so inject it immediately instead of waiting for
+        // the next keeper tick (the first SOCKS request can arrive very fast).
+        public static void InjectAllNow()
+        {
+            if (string.IsNullOrEmpty(_dll)) return;
+            try { InjectAll(); } catch { }
+        }
 
         static void KeeperLoop()
         {
