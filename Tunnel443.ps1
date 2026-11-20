@@ -35,6 +35,8 @@ param(
     [string] $UdpGwDns        = '',
     [string] $BindIp          = '',
     [int]    $BindIfIndex     = 0,
+    [string] $BindNicDll      = '',
+    [switch] $NoSshdBind,
     [switch] $UdpGwVerbose,
     [switch] $NoAutoDetect
 )
@@ -54,6 +56,9 @@ using System.Security.Authentication;
 using System.Security.Cryptography.X509Certificates;
 using System.Collections.Generic;
 using System.Threading;
+using System.Diagnostics;
+using System.Runtime.InteropServices;
+using System.Text;
 
 namespace Ssh443
 {
@@ -696,10 +701,149 @@ namespace Ssh443
                  + " err=" + Interlocked.Read(ref Errs);
         }
     }
+
+    // ------------------------------------------------------------- sshd binder
+    // OpenSSH creates a NEW sshd.exe child for every incoming connection.  Those
+    // children are the processes that open the sockets for SOCKS / direct-tcpip
+    // forwarding.  If nothing is done, Windows sends those sockets back through
+    // the client's TUN default route (0.0.0.0/1 + 128.0.0.0/1) and the whole
+    // tunnel recurses until the internet "dies".  This keeper injects
+    // bindnic.dll into every sshd.exe process so each new socket is pinned to
+    // the physical NIC (source IP + IP_UNICAST_IF) and bypasses the TUN.
+    public static class BindNic
+    {
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern IntPtr OpenProcess(uint access, bool inherit, int pid);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern IntPtr VirtualAllocEx(IntPtr h, IntPtr addr, int size, uint type, uint prot);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern bool WriteProcessMemory(IntPtr h, IntPtr addr, byte[] buf, int size, out int written);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern IntPtr CreateRemoteThread(IntPtr h, IntPtr sa, int stack, IntPtr start, IntPtr param, uint flags, out int tid);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern IntPtr GetModuleHandle(string name);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern IntPtr GetProcAddress(IntPtr h, string name);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern bool CloseHandle(IntPtr h);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern uint WaitForSingleObject(IntPtr h, uint ms);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern bool VirtualFreeEx(IntPtr h, IntPtr addr, int size, uint type);
+        [DllImport("psapi.dll", SetLastError = true)]
+        static extern bool EnumProcessModules(IntPtr h, IntPtr[] modules, int size, out int needed);
+        [DllImport("psapi.dll", CharSet = CharSet.Unicode)]
+        static extern int GetModuleFileNameEx(IntPtr h, IntPtr module, System.Text.StringBuilder name, int size);
+
+        const uint MEM_COMMIT = 0x1000, MEM_RESERVE = 0x2000, MEM_RELEASE = 0x8000;
+        const uint PAGE_READWRITE = 0x4;
+        const uint ACCESS_INJECT = 0x0438; // VM_READ|VM_WRITE|VM_OPERATION|QUERY_INFO|CREATE_THREAD
+        const uint ACCESS_SCAN   = 0x0410; // VM_READ|QUERY_INFO
+
+        static string _dll = "";
+        static Thread _keeper = null;
+        static volatile bool _stop = false;
+        static int _injected = 0;
+
+        public static int Injected { get { return _injected; } }
+
+        public static void StartKeeper(string dllPath)
+        {
+            if (string.IsNullOrEmpty(dllPath) || !File.Exists(dllPath))
+            {
+                Log.Write("sshd binder : DLL not found (" + dllPath + ") - TUN loop protection OFF");
+                return;
+            }
+            _dll = Path.GetFullPath(dllPath);
+            if (_keeper != null) return;
+            _stop = false;
+            _keeper = new Thread(KeeperLoop);
+            _keeper.IsBackground = true;
+            _keeper.Start();
+            Log.Write("sshd binder : watching sshd.exe -> " + _dll);
+        }
+
+        public static void StopKeeper() { _stop = true; }
+
+        static void KeeperLoop()
+        {
+            while (!_stop)
+            {
+                try { InjectAll(); } catch { }
+                Thread.Sleep(750);
+            }
+        }
+
+        static bool IsInjected(int pid)
+        {
+            IntPtr h = OpenProcess(ACCESS_SCAN, false, pid);
+            if (h == IntPtr.Zero) return true;   // cannot inspect - assume OK to avoid log spam
+            try
+            {
+                IntPtr[] mods = new IntPtr[512];
+                int needed = 0;
+                if (!EnumProcessModules(h, mods, mods.Length * IntPtr.Size, out needed)) return false;
+                int count = Math.Min(needed / IntPtr.Size, mods.Length);
+                for (int i = 0; i < count; i++)
+                {
+                    StringBuilder sb = new StringBuilder(260);
+                    if (GetModuleFileNameEx(h, mods[i], sb, sb.Capacity) > 0 &&
+                        sb.ToString().EndsWith("bindnic.dll", StringComparison.OrdinalIgnoreCase))
+                        return true;
+                }
+                return false;
+            }
+            finally { CloseHandle(h); }
+        }
+
+        static void InjectAll()
+        {
+            Process[] procs = Process.GetProcessesByName("sshd");
+            foreach (Process p in procs)
+            {
+                try
+                {
+                    if (IsInjected(p.Id)) continue;
+                    if (Inject(p.Id, _dll)) Log.Write("sshd binder : injected pid " + p.Id);
+                }
+                catch { }
+                finally { p.Dispose(); }
+            }
+        }
+
+        static bool Inject(int pid, string dll)
+        {
+            byte[] path = System.Text.Encoding.ASCII.GetBytes(dll + "\0");
+            IntPtr h = OpenProcess(ACCESS_INJECT, false, pid);
+            if (h == IntPtr.Zero) return false;
+            IntPtr remote = IntPtr.Zero;
+            try
+            {
+                remote = VirtualAllocEx(h, IntPtr.Zero, path.Length, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+                if (remote == IntPtr.Zero) return false;
+                int written;
+                if (!WriteProcessMemory(h, remote, path, path.Length, out written)) return false;
+                IntPtr load = GetProcAddress(GetModuleHandle("kernel32.dll"), "LoadLibraryA");
+                if (load == IntPtr.Zero) return false;
+                int tid;
+                IntPtr th = CreateRemoteThread(h, IntPtr.Zero, 0, load, remote, 0, out tid);
+                if (th == IntPtr.Zero) return false;
+                WaitForSingleObject(th, 5000);
+                CloseHandle(th);
+                Interlocked.Increment(ref _injected);
+                return true;
+            }
+            finally
+            {
+                if (remote != IntPtr.Zero) VirtualFreeEx(h, remote, 0, MEM_RELEASE);
+                CloseHandle(h);
+            }
+        }
+    }
 }
 '@
 
-if (-not ('Ssh443.Tunnel' -as [type])) {
+if (-not ('Ssh443.BindNic' -as [type])) {
     Add-Type -TypeDefinition $cs -Language CSharp -ErrorAction Stop
 }
 
@@ -728,6 +872,18 @@ if ($BindIfIndex -le 0 -and $BindIp -ne '0.0.0.0') {
 }
 if ($BindIfIndex -gt 0) { [Ssh443.UdpGw]::OutIfIndex = $BindIfIndex }
 [Ssh443.Log]::Write("udp nic     : ifIndex $BindIfIndex  (IP_UNICAST_IF - bypass TUN)")
+
+# ================================================================== sshd binder
+# The SSH service forks a fresh sshd.exe per connection.  Those children open
+# the outbound sockets for SOCKS/direct-tcpip and would otherwise follow the
+# TUN default route straight back into this tunnel (infinite loop / no net).
+# A background keeper pins each new sshd process to the physical NIC.
+if (-not $NoSshdBind) {
+    if ([string]::IsNullOrWhiteSpace($BindNicDll)) {
+        $BindNicDll = Join-Path $PSScriptRoot 'native\bindnic.dll'
+    }
+    [Ssh443.BindNic]::StartKeeper($BindNicDll)
+}
 
 # ================================================================== certificate
 if ([string]::IsNullOrWhiteSpace($CertThumbprint)) {
