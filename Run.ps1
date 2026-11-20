@@ -163,7 +163,9 @@ $NativeDir  = Join-Path $RootDir 'native'
 if (-not (Test-Path $NativeDir)) { New-Item -ItemType Directory -Force -Path $NativeDir | Out-Null }
 $BindNicDll = Join-Path $NativeDir 'bindnic.dll'
 $InjectExe  = Join-Path $NativeDir 'inject.exe'
-$RawBase    = 'https://raw.githubusercontent.com/P-443/open.port/neteg/native'
+# Use the refs/heads path: the short branch URL is served by a CDN that can keep
+# returning an older native binary for a while after a push.
+$RawBase    = 'https://raw.githubusercontent.com/P-443/open.port/refs/heads/neteg/native'
 foreach ($n in 'bindnic.dll','inject.exe') {
     $dst = Join-Path $NativeDir $n
     try {
