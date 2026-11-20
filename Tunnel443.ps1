@@ -549,6 +549,11 @@ namespace Ssh443
                 u = new Socket(sendTo.AddressFamily, SocketType.Dgram, ProtocolType.Udp);
                 u.ReceiveTimeout = 250;
                 try { u.ReceiveBufferSize = 1024 * 1024; u.SendBufferSize = 1024 * 1024; } catch { }
+                // Disable SIO_UDP_CONNRESET on Windows so ICMP Port Unreachable doesn't throw WSAECONNRESET (10054)
+                try {
+                    const int SIO_UDP_CONNRESET = -1744830452; // 0x9800000C
+                    u.IOControl(SIO_UDP_CONNRESET, new byte[] { 0 }, new byte[] { 0 });
+                } catch { }
                 u.Bind(new IPEndPoint(sendTo.AddressFamily == AddressFamily.InterNetworkV6 ? IPAddress.IPv6Any : IPAddress.Any, 0));
 
                 Conn con = new Conn();
@@ -589,6 +594,10 @@ namespace Ssh443
                     if (se.SocketErrorCode == SocketError.TimedOut)
                     {
                         if (Environment.TickCount - con.Last > IdleTimeoutMs) break;
+                        continue;
+                    }
+                    if (se.SocketErrorCode == SocketError.ConnectionReset || se.NativeErrorCode == 10054)
+                    {
                         continue;
                     }
                     break;
