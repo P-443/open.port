@@ -8,7 +8,8 @@
 
     Part 1 : TLS/plain listener on <BindIp>:<Port> forwarding to 127.0.0.1:<TargetPort>
              - BindIp is the detected physical NIC, never the VPN/TUN adapter
-             - outbound UDP sockets are bound to the same IP (no TUN loop)
+             - outbound UDP sockets are bound to the same IP AND pinned to the same
+               NIC by index (IP_UNICAST_IF) - a TUN default route cannot steal them
              - first byte 0x16  -> real TLS handshake (HTTP Custom "TLS + SNI")
              - anything else    -> transparent pass-through (raw ssh on 443)
     Part 2 : UDP gateway on <UdpGwPort> (default 127.0.0.1:7300, reached through
@@ -33,6 +34,7 @@ param(
     [string] $UdpGwBind       = '127.0.0.1',
     [string] $UdpGwDns        = '',
     [string] $BindIp          = '',
+    [int]    $BindIfIndex     = 0,
     [switch] $UdpGwVerbose,
     [switch] $NoAutoDetect
 )
@@ -309,6 +311,7 @@ namespace Ssh443
         public static string DnsHost = "";
         public static int DnsPort = 53;
         public static string OutBindIp = "";   // source IP for outbound UDP (physical NIC)
+        public static int    OutIfIndex = 0;   // force outgoing UDP onto this NIC via IP_UNICAST_IF
 
         public static long Sessions = 0, ConnTotal = 0, ConnActive = 0, PktsUp = 0, PktsDown = 0, Errs = 0;
 
@@ -333,6 +336,7 @@ namespace Ssh443
             public IPEndPoint SendTo;      // address we actually send to (dns override)
             public Thread Rx;
             public long Last;
+            public bool Logged = false;   // log the first datagram of each connection
             public volatile bool Dead = false;
         }
 
@@ -540,6 +544,16 @@ namespace Ssh443
                 else con.Last = Environment.TickCount;
             }
 
+            // One info line per UDP flow - makes "server doesn't support UDP"
+            // diagnosable without turning on full packet logging.
+            if (!con.Logged)
+            {
+                con.Logged = true;
+                Log.Write("udpgw first : conid=" + con.ConId + " target=" + sendTo +
+                          (sendTo.Equals(orig) ? "" : " (dns-override from " + orig + ")") +
+                          " dlen=" + dataLen + " if=" + OutIfIndex);
+            }
+
             try
             {
                 con.Udp.SendTo(b, pos, dataLen, SocketFlags.None, sendTo);
@@ -569,6 +583,24 @@ namespace Ssh443
                     u.Bind(new IPEndPoint(src, 0));
                 else
                     u.Bind(new IPEndPoint(sendTo.AddressFamily == AddressFamily.InterNetworkV6 ? IPAddress.IPv6Any : IPAddress.Any, 0));
+
+                // A bound source IP alone is NOT enough: with a TUN default route
+                // Windows may still push these datagrams into the VPN (loop).
+                // IP_UNICAST_IF pins the outgoing interface by index and wins over
+                // the route table. Winsock wants the index in NETWORK byte order.
+                if (OutIfIndex > 0)
+                {
+                    try
+                    {
+                        if (sendTo.AddressFamily == AddressFamily.InterNetwork)
+                            u.SetSocketOption(SocketOptionLevel.IP, (SocketOptionName)31 /* IP_UNICAST_IF */,
+                                              IPAddress.HostToNetworkOrder(OutIfIndex));
+                        else
+                            u.SetSocketOption(SocketOptionLevel.IPv6, (SocketOptionName)16 /* IPV6_UNICAST_IF */,
+                                              IPAddress.HostToNetworkOrder(OutIfIndex));
+                    }
+                    catch (Exception ex) { Log.Write("udpgw ifbind warn: " + ex.Message); }
+                }
 
                 Conn con = new Conn();
                 con.Owner = ses; con.ConId = conid; con.Udp = u;
@@ -684,6 +716,18 @@ if ([string]::IsNullOrWhiteSpace($BindIp)) {
 }
 if ([string]::IsNullOrWhiteSpace($BindIp)) { $BindIp = '0.0.0.0' }
 [Ssh443.Log]::Write("bind ip     : $BindIp  (physical NIC only - TUN/VPN adapter excluded)")
+
+# Resolve the interface index used by IP_UNICAST_IF. A bound source IP alone can
+# still be routed into a TUN default route; pinning the NIC by index cannot.
+if ($BindIfIndex -le 0 -and $BindIp -ne '0.0.0.0') {
+    try {
+        $a = Get-NetIPAddress -AddressFamily IPv4 -IPAddress $BindIp -ErrorAction SilentlyContinue |
+             Select-Object -First 1
+        if ($a) { $BindIfIndex = [int]$a.InterfaceIndex }
+    } catch { }
+}
+if ($BindIfIndex -gt 0) { [Ssh443.UdpGw]::OutIfIndex = $BindIfIndex }
+[Ssh443.Log]::Write("udp nic     : ifIndex $BindIfIndex  (IP_UNICAST_IF - bypass TUN)")
 
 # ================================================================== certificate
 if ([string]::IsNullOrWhiteSpace($CertThumbprint)) {
