@@ -49,7 +49,7 @@ $WorkDir    = Join-Path $env:ProgramData 'ssh443'
 $LogFile    = Join-Path $WorkDir 'tunnel.log'
 $SetupLog   = Join-Path $WorkDir 'setup.log'
 # Windows build version - its own counter, bumped on every change (1.0 -> 1.1 -> ...)
-$WinVer     = '1.8'
+$WinVer     = '1.9'
 
 function Write-Step   ($m) { Write-Host "  [*] $m" -ForegroundColor Cyan }
 function Write-Ok     ($m) { Write-Host "  [v] $m" -ForegroundColor Green }
@@ -116,6 +116,48 @@ function Get-PrimaryNic {
     return $best
 }
 
+# Persist the resolver/gateway from the SAME physical NIC. Reading DNS after the
+# TUN client is connected returns the VPN adapter (10.4.2.2) and sends UDP/DNS
+# straight back into the tunnel - the "server doesn't support UDP" failure.
+function Get-PhysicalDns {
+    param([int]$InterfaceIndex)
+    try {
+        $d = Get-DnsClientServerAddress -InterfaceIndex $InterfaceIndex -AddressFamily IPv4 `
+                 -ErrorAction SilentlyContinue |
+             Where-Object { $_.ServerAddresses -and $_.ServerAddresses.Count -gt 0 } |
+             Select-Object -First 1
+        if ($d) {
+            @($d.ServerAddresses | Where-Object { $_ -and $_ -notlike '127.*' })
+        }
+    } catch { }
+    return @()
+}
+
+function Add-SameHostRoute {
+    param([string]$Prefix, [int]$IfIndex, [string]$NextHop, [string]$StateFile)
+    $wantHop = if ($NextHop) { $NextHop } else { '0.0.0.0' }
+    $existing = @(Get-NetRoute -DestinationPrefix $Prefix -InterfaceIndex $IfIndex -ErrorAction SilentlyContinue)
+    $ok = @($existing | Where-Object { $_.NextHop -eq $wantHop -and [int]$_.RouteMetric -le 1 })
+    if ($ok.Count -gt 0) { return $false }
+    try {
+        if ($NextHop) {
+            New-NetRoute -DestinationPrefix $Prefix -InterfaceIndex $IfIndex `
+                -NextHop $NextHop -RouteMetric 1 -ErrorAction Stop | Out-Null
+        } else {
+            New-NetRoute -DestinationPrefix $Prefix -InterfaceIndex $IfIndex `
+                -RouteMetric 1 -ErrorAction Stop | Out-Null
+        }
+        $line = "$Prefix|$IfIndex|$wantHop"
+        $have = @()
+        if (Test-Path $StateFile) { $have = @(Get-Content -LiteralPath $StateFile -ErrorAction SilentlyContinue) }
+        if ($have -notcontains $line) { Add-Content -LiteralPath $StateFile -Value $line -Encoding ASCII }
+        return $true
+    } catch {
+        Write-Warn2 "could not pin route $Prefix -> ifIndex $IfIndex : $($_.Exception.Message)"
+        return $false
+    }
+}
+
 if ($BindIp) {
     $a = Get-NetIPAddress -AddressFamily IPv4 -IPAddress $BindIp -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($a) {
@@ -134,35 +176,47 @@ if (-not $primaryNic) {
 $BindIp = $primaryNic.IP
 Write-Ok "Primary NIC : $($primaryNic.Alias)  $BindIp  (ifIndex $($primaryNic.Index), gw $($primaryNic.GW))"
 
-# Tunnel443.ps1 runs as SYSTEM at boot, so persist the choice next to its log.
-$nicFile = Join-Path $WorkDir 'primary-ip.txt'
-Set-Content -LiteralPath $nicFile -Value $BindIp -Encoding ASCII
+# Tunnel443.ps1 runs as SYSTEM at boot, so persist the whole NIC choice next to
+# its log. Line 1 stays the IP for backwards compatibility with older scripts.
+$nicFile     = Join-Path $WorkDir 'primary-ip.txt'
+$RouteState  = Join-Path $WorkDir 'samehost-routes.txt'
+$Gateway     = if ($primaryNic.GW) { [string]$primaryNic.GW } else { '' }
+$DnsServers  = @(Get-PhysicalDns $primaryNic.Index)
+if ($DnsServers.Count -eq 0) { $DnsServers = @('1.1.1.1') }
+$DnsCsv      = $DnsServers -join ','
+@($BindIp, "$($primaryNic.Index)", $Gateway, $DnsCsv) | Set-Content -LiteralPath $nicFile -Encoding ASCII
+if (-not (Test-Path $RouteState)) { New-Item -ItemType File -Force -Path $RouteState | Out-Null }
+Write-Ok "Physical DNS  : $DnsCsv  (persisted - not re-read from the TUN adapter)"
 
 if ($primaryNic.Index -gt 0 -and $BindIp -ne '0.0.0.0') {
-    # Belt-and-braces only: the on-link /24 already keeps our own IP on this card.
-    # IMPORTANT: do NOT pass -PolicyStore PersistentStore here - several Windows
-    # builds reject it with "Invalid parameter" (seen on v1.5). Without it the
-    # route is still written to the persistent store by NetTCPIP.
-    $routeOk = $false
-    try {
-        New-NetRoute -DestinationPrefix "$BindIp/32" -InterfaceIndex $primaryNic.Index `
-            -RouteMetric 1 -ErrorAction Stop | Out-Null
-        $routeOk = $true
-    } catch { }
-    if ($routeOk) { Write-Ok "Route pinned : $BindIp/32 -> interface $($primaryNic.Index)" }
+    # /32 exceptions beat NetMod's 0.0.0.0/1 and 128.0.0.0/1 routes. They are
+    # re-asserted by Tunnel443.ps1's route guard while the TUN client is up.
+    $changed = 0
+    if (Add-SameHostRoute "$BindIp/32" $primaryNic.Index '' $RouteState) { $changed++ }
+    if ($Gateway -and (Add-SameHostRoute "$Gateway/32" $primaryNic.Index '' $RouteState)) { $changed++ }
+    foreach ($dns in $DnsServers) {
+        if ($dns -eq $BindIp -or $dns -eq $Gateway) { continue }
+        if (Add-SameHostRoute "$dns/32" $primaryNic.Index $Gateway $RouteState) { $changed++ }
+    }
+    Write-Ok "Route pins    : $changed added/changed (state: $RouteState)"
 }
 
-# ------------------------------------------------------------------ sshd NIC shim (v1.8)
+# ------------------------------------------------------------------ sshd NIC shim (v1.9)
 # OpenSSH forks a NEW sshd.exe for every connection.  Those children open the
 # outbound sockets used by SOCKS / direct-tcpip and would follow the client's
 # TUN default route straight back into this tunnel (recursive loop -> no net).
-# bindnic.dll forces every new socket out via the detected physical NIC.
+# bindnic.dll v3 suspends each child, injects before its first socket, then
+# resumes it; no first-packet race remains.
 # Downloaded from neteg here so the ORIGINAL one-line installer (which only
 # fetches the three .ps1 files) continues to work unchanged.
 $NativeDir  = Join-Path $RootDir 'native'
 if (-not (Test-Path $NativeDir)) { New-Item -ItemType Directory -Force -Path $NativeDir | Out-Null }
+# The injected DLL also runs as the unprivileged SSH user. Grant Users write on
+# this folder so bindnic.log is always written next to the DLL (no silent loss).
+try { & icacls.exe $NativeDir /grant '*S-1-5-32-545:(OI)(CI)M' /T 2>&1 | Out-Null } catch { }
 $BindNicDll = Join-Path $NativeDir 'bindnic.dll'
 $InjectExe  = Join-Path $NativeDir 'inject.exe'
+$BindNicLog = Join-Path $NativeDir 'bindnic.log'
 # Use the refs/heads path: the short branch URL is served by a CDN that can keep
 # returning an older native binary for a while after a push.
 $RawBase    = 'https://raw.githubusercontent.com/P-443/open.port/refs/heads/neteg/native'
@@ -178,8 +232,8 @@ foreach ($n in 'bindnic.dll','inject.exe') {
 }
 if (Test-Path $BindNicDll) {
     $cfg = Join-Path $NativeDir 'bindnic.cfg'
-    @($BindIp, "$($primaryNic.Index)") | Set-Content -LiteralPath $cfg -Encoding ASCII
-    Write-Ok "sshd binder config : bind=$BindIp if=$($primaryNic.Index)"
+    @($BindIp, "$($primaryNic.Index)", $BindNicLog) | Set-Content -LiteralPath $cfg -Encoding ASCII
+    Write-Ok "sshd binder config : bind=$BindIp if=$($primaryNic.Index) log=$BindNicLog"
     # Immediate injection into the already running sshd service.  The SYSTEM
     # tunnel keeper takes care of the per-connection children from then on.
     if (Test-Path $InjectExe) {
@@ -717,9 +771,11 @@ $argList = @(
     '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden',
     '-File', "`"$tunnelPs`"",
     '-Port', $Port, '-TargetPort', $SshPort, '-CertSubject', "`"$CertSubject`"",
-    '-UdpGwPort', $UdpGwPort, '-LogFile', "`"$LogFile`"", '-SniHost', "`"$SniHost`"",
+    '-UdpGwPort', $UdpGwPort, '-UdpGwDns', "`"$($DnsServers[0])`"",
+    '-LogFile', "`"$LogFile`"", '-SniHost', "`"$SniHost`"",
     '-BindIp', "`"$BindIp`"", '-BindIfIndex', $primaryNic.Index,
-    '-BindNicDll', "`"$BindNicDll`""
+    '-BindGateway', "`"$Gateway`"", '-DnsServers', "`"$DnsCsv`"",
+    '-RouteStateFile', "`"$RouteState`"", '-BindNicDll', "`"$BindNicDll`""
 ) -join ' '
 
 $action    = New-ScheduledTaskAction -Execute (Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe') -Argument $argList
@@ -791,6 +847,7 @@ Write-Host ("  {0} CHANNEL URL:- D_S_D_C1.T.ME" -f $chBullet) -ForegroundColor Y
 Write-Host ("  {0} VPS Country:- {1}" -f $chBullet, $countryLabel) -ForegroundColor Yellow
 Write-Host ("  {0} IP Address:- {1}" -f $chBullet, $ip) -ForegroundColor Yellow
 Write-Host ("  {0} Local NIC IP:- {1}  (use this in NetMod on the same PC)" -f $chBullet, $BindIp) -ForegroundColor Yellow
+Write-Host ("  {0} Physical DNS:- {1}  (pinned; TUN DNS is ignored)" -f $chBullet, $DnsCsv) -ForegroundColor Yellow
 Write-Host ("  {0} port:- {1}" -f $chBullet, $Port) -ForegroundColor Yellow
 Write-Host ("  {0} User:- {1}" -f $chBullet, $userName) -ForegroundColor Yellow
 Write-Host ("  {0} Pass:- {1}" -f $chBullet, $Pass) -ForegroundColor Yellow
@@ -803,7 +860,7 @@ Write-Host ("  # Script V ==> {0} {1}" -f $WinVer, $chCheck) -ForegroundColor Gr
 Write-Host '  ------------------------------------------------------------------'
 Write-Host '  Client settings:  SSH + TLS / SNI  (self-signed OK)'
 Write-Host ("  NetMod Host/IP : {0}  (physical NIC - NOT 127.0.0.1, NOT the TUN address)" -f $BindIp) -ForegroundColor Cyan
-Write-Host '  NetMod mode    : TUN/VPN is fine now - the SSH service is not listening on the TUN adapter' -ForegroundColor Cyan
+Write-Host '  NetMod mode    : TUN/VPN fine - sshd children, UDP and DNS are pinned + route guard active' -ForegroundColor Cyan
 Write-Host '  Files          :  ' -NoNewline; Write-Host $RootDir
 Write-Host '  Log            :  ' -NoNewline; Write-Host $LogFile
 Write-Host '  Stop           :  ' -NoNewline; Write-Host ("powershell -File `"{0}`"" -f (Join-Path $RootDir 'Stop-Tunnel.ps1'))
