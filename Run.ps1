@@ -49,7 +49,7 @@ $WorkDir    = Join-Path $env:ProgramData 'ssh443'
 $LogFile    = Join-Path $WorkDir 'tunnel.log'
 $SetupLog   = Join-Path $WorkDir 'setup.log'
 # Windows build version - its own counter, bumped on every change (1.0 -> 1.1 -> ...)
-$WinVer     = '1.9.1'
+$WinVer     = '1.9.2'
 
 function Write-Step   ($m) { Write-Host "  [*] $m" -ForegroundColor Cyan }
 function Write-Ok     ($m) { Write-Host "  [v] $m" -ForegroundColor Green }
@@ -251,9 +251,23 @@ foreach ($n in 'bindnic.dll','inject.exe') {
         }
         if (-not $got) { Start-Sleep -Milliseconds 750 }
     }
+    # Fallback for the DLL only: a plain-text base64 copy downloads reliably
+    # even where a binary .dll GET is blocked, cached stale, or quarantined.
+    # The installer already proves text downloads from this host work.
+    if ($n -eq 'bindnic.dll' -and -not $got -and -not (Test-NativeFile $dst $want)) {
+        foreach ($base in @($RawBase, $AltBase)) {
+            try {
+                $c = (Invoke-WebRequest -Uri "$base/bindnic.b64" -UseBasicParsing -TimeoutSec 60 -ErrorAction Stop).Content
+                if ($c -is [byte[]]) { $c = [Text.Encoding]::ASCII.GetString($c) }
+                $bytes = [Convert]::FromBase64String(($c -replace '\s',''))
+                [IO.File]::WriteAllBytes($dst, $bytes)
+                if (Test-NativeFile $dst $want) { $got = $true; break }
+            } catch { }
+        }
+    }
     if ($got) { Write-Ok "Downloaded native/$n (verified)" }
     elseif (Test-NativeFile $dst $want) { Write-Ok "Cached native/$n is v3 (verified)" }
-    elseif (Test-Path $dst) { Write-Warn2 "Cached $n is STALE - suspended-inject fix NOT active; rerun with internet available" }
+    elseif (Test-Path $dst) { Write-Warn2 "Cached $n is STALE - suspended-inject fix NOT active" }
     else { Write-Warn2 "Could not download $n - TUN loop protection OFF" }
 }
 if (Test-Path $BindNicDll) {
