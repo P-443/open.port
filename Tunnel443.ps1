@@ -926,13 +926,28 @@ function Get-SameHostRoutes {
     }
     return $list
 }
+$script:RouteGuardState = @{}
 function Assert-SameHostRoutes {
     if ($BindIfIndex -le 0) { return }
     foreach ($r in (Get-SameHostRoutes)) {
         $wantHop = if ($r.Hop) { $r.Hop } else { '0.0.0.0' }
-        $found = @(Get-NetRoute -DestinationPrefix $r.Prefix -InterfaceIndex $BindIfIndex -ErrorAction SilentlyContinue |
-                   Where-Object { $_.NextHop -eq $wantHop -and [int]$_.RouteMetric -le 1 })
-        if ($found.Count -gt 0) { continue }
+        $key = "$($r.Prefix)|$BindIfIndex|$wantHop"
+
+        # ANY /32 route on the physical NIC is more specific than NetMod's /1
+        # routes - that is all the bypass needs. Windows itself creates an
+        # on-link /32 with metric 256; requiring NextHop=0.0.0.0 AND metric<=1
+        # made the guard try to add a duplicate every 10 s and log
+        # "MSFT_NetRoute already exists" forever.
+        $found = @(Get-NetRoute -DestinationPrefix $r.Prefix -InterfaceIndex $BindIfIndex -ErrorAction SilentlyContinue)
+        if ($found.Count -gt 0) {
+            if ($script:RouteGuardState[$key] -ne 'ok') {
+                $script:RouteGuardState[$key] = 'ok'
+                $via = @($found | ForEach-Object { if ($_.NextHop) { $_.NextHop } else { 'on-link' } }) -join ','
+                $met = @($found | ForEach-Object { [int]$_.RouteMetric }) -join ','
+                [Ssh443.Log]::Write("route guard : ok $($r.Prefix) if=$BindIfIndex via=$via metric=$met")
+            }
+            continue
+        }
         try {
             if ($r.Hop) {
                 New-NetRoute -DestinationPrefix $r.Prefix -InterfaceIndex $BindIfIndex `
@@ -945,9 +960,14 @@ function Assert-SameHostRoutes {
             $have = @()
             if (Test-Path $RouteStateFile) { $have = @(Get-Content -LiteralPath $RouteStateFile -ErrorAction SilentlyContinue) }
             if ($have -notcontains $line) { Add-Content -LiteralPath $RouteStateFile -Value $line -Encoding ASCII }
+            $script:RouteGuardState[$key] = 'ok'
             [Ssh443.Log]::Write("route guard : added $($r.Prefix) via $wantHop if=$BindIfIndex")
         } catch {
-            [Ssh443.Log]::Write("route guard : FAILED $($r.Prefix) via $wantHop - $($_.Exception.Message)")
+            # Log only the first failure; repeat only after the state changes.
+            if ($script:RouteGuardState[$key] -ne 'failed') {
+                $script:RouteGuardState[$key] = 'failed'
+                [Ssh443.Log]::Write("route guard : FAILED $($r.Prefix) via $wantHop - $($_.Exception.Message) (further failures suppressed)")
+            }
         }
     }
 }
