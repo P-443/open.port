@@ -47,6 +47,7 @@ powershell -ExecutionPolicy Bypass -File .\Run.ps1 -User myuser -Pass 'MySecureP
 | `-UdpGwPort` | `7300` | Port for the badvpn-compatible UDP gateway (`0` to disable) |
 | `-SniHost` | `$User` | Domain name to include in the self-signed TLS certificate |
 | `-BindIp` | auto | Physical NIC IP to bind sshd + the 443 listener + UDP sockets to (auto-detected if omitted) |
+| `-BindIfIndex` | auto | NIC index for `IP_UNICAST_IF` so UDP bypasses a TUN default route (passed automatically by `Run.ps1`) |
 | `-NoUdpgw` | `False` | Switch to disable the UDP gateway completely |
 
 ---
@@ -82,6 +83,11 @@ When you enable **TUN Mode** in NetMod:
 ### How to Fix It:
 
 #### Option 0 (v1.5+): The script pins the SSH service to the physical NIC - automatic
+
+> **v1.6:** UDP now also uses `IP_UNICAST_IF` to pin outbound datagrams to the detected
+> NIC **by interface index**, not just by source IP. This is what fixes the
+> `WARNING: This server doesn't support UDP` message when a TUN/VPN default route
+> is active — binding the source address alone is not enough on Windows.
 `Run.ps1` now detects the real Wi-Fi/Ethernet card (it skips TAP/Wintun/NetMod/VPN/Hyper-V/WSL adapters) and:
 - writes `ListenAddress 127.0.0.1` + `ListenAddress <physical-IP>` into `sshd_config` (sshd never listens on the TUN adapter),
 - binds the TLS listener on port 443 to that same IP instead of `0.0.0.0`,
