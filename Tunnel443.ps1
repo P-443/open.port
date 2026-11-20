@@ -897,6 +897,8 @@ if (-not $NoSshdBind) {
         $BindNicDll = Join-Path $PSScriptRoot 'native\bindnic.dll'
     }
     [Ssh443.BindNic]::StartKeeper($BindNicDll)
+    [Ssh443.Log]::Write("sshd binder : v2 active - children injected at CreateProcess; details in " +
+                        [System.IO.Path]::Combine([System.IO.Path]::GetDirectoryName($BindNicDll), "bindnic.log"))
 }
 
 # ================================================================== certificate
