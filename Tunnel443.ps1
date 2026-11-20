@@ -35,6 +35,10 @@ param(
     [string] $UdpGwDns        = '',
     [string] $BindIp          = '',
     [int]    $BindIfIndex     = 0,
+    [string] $BindGateway     = '',
+    [string] $DnsServers      = '',
+    [string] $RouteStateFile  = '',
+    [int]    $RouteGuardInterval = 10,
     [string] $BindNicDll      = '',
     [switch] $NoSshdBind,
     [switch] $UdpGwVerbose,
@@ -335,6 +339,7 @@ namespace Ssh443
             public object SendLock = new object();
             public Dictionary<int, Conn> Conns = new Dictionary<int, Conn>();
             public string Peer = "?";
+            public bool KeepaliveLogged = false;
         }
 
         private class Conn
@@ -361,6 +366,8 @@ namespace Ssh443
 
             _listener = Tunnel.ListenAny(ip.Equals(IPAddress.Any) ? null : ip.ToString(), port, 128);
             Log.Write("udpgw listen: " + ip.ToString() + ":" + port + (DnsHost.Length > 0 ? "  dns=" + DnsHost + ":" + DnsPort : ""));
+            if (DnsHost.Length > 0)
+                Log.Write("udpgw dns   : " + DnsHost + ":" + DnsPort + " (persisted physical NIC resolver - not TUN DNS)");
 
             Thread t = new Thread(new ThreadStart(AcceptLoop));
             t.IsBackground = true; t.Name = "udpgw-accept"; t.Start();
@@ -436,7 +443,7 @@ namespace Ssh443
                     if (len < 3 || len > buf.Length) { Log.Write("udpgw bad len " + len + " from " + ses.Peer); break; }
                     if (!ReadExact(ses.S, buf, len)) break;
                     if (Verbose) Log.Write("udpgw recv  : " + ses.Peer + " flags=0x" + buf[0].ToString("X2")
-                        + " conid=" + (((buf[1] << 8) | buf[2])) + " len=" + len + " hex=" + Hex(buf, 0, len < 16 ? len : 16));
+                        + " conid=" + (buf[1] | (buf[2] << 8)) + " len=" + len + " hex=" + Hex(buf, 0, len < 16 ? len : 16));
                     Message(ses, buf, len);
                 }
             }
@@ -500,11 +507,16 @@ namespace Ssh443
         private static void Message(Session ses, byte[] b, int len)
         {
             int flags = b[0];
-            int conid = (b[1] << 8) | b[2];
+            int conid = b[1] | (b[2] << 8);   // badvpn header conid is LITTLE endian
             int pos = 3;
 
             if ((flags & FLAG_KEEPALIVE) != 0)
             {
+                if (!ses.KeepaliveLogged)
+                {
+                    ses.KeepaliveLogged = true;
+                    Log.Write("udpgw keepalive: " + ses.Peer + " (client confirmed UDPGW protocol)");
+                }
                 if (Verbose) Log.Write("udpgw keepalive: conid=" + conid + " len=" + len);
                 return;
             }
@@ -683,8 +695,8 @@ namespace Ssh443
             outBuf[0] = (byte)(total & 0xFF);      // PacketProto length is little endian
             outBuf[1] = (byte)(total >> 8);
             outBuf[2] = (byte)(v6 ? FLAG_IPV6 : 0);
-            outBuf[3] = (byte)(con.ConId >> 8);
-            outBuf[4] = (byte)(con.ConId & 0xFF);
+            outBuf[3] = (byte)(con.ConId & 0xFF);
+            outBuf[4] = (byte)(con.ConId >> 8);
             Array.Copy(ip, 0, outBuf, 5, ip.Length);
             int pt = 5 + ip.Length;
             outBuf[pt]     = (byte)(con.Remote.Port >> 8);
@@ -867,12 +879,23 @@ if ($logDir -and -not (Test-Path $logDir)) { New-Item -ItemType Directory -Force
 [Ssh443.Log]::File = $LogFile
 
 # ================================================================== primary NIC
-# Run.ps1 passes -BindIp explicitly; the file is the fallback for the SYSTEM task.
-if ([string]::IsNullOrWhiteSpace($BindIp)) {
-    $nicFile = Join-Path $logDir 'primary-ip.txt'
-    if (Test-Path $nicFile) { $BindIp = (Get-Content -LiteralPath $nicFile -TotalCount 1).Trim() }
-}
+# Run.ps1 passes everything explicitly; the state file is the SYSTEM-task fallback.
+$nicFile = Join-Path $logDir 'primary-ip.txt'
+$state   = @()
+if (Test-Path $nicFile) { $state = @(Get-Content -LiteralPath $nicFile -ErrorAction SilentlyContinue) }
+if ([string]::IsNullOrWhiteSpace($BindIp) -and $state.Count -gt 0) { $BindIp = $state[0].Trim() }
 if ([string]::IsNullOrWhiteSpace($BindIp)) { $BindIp = '0.0.0.0' }
+if ($BindIfIndex -le 0 -and $state.Count -gt 1) {
+    $n = 0; if ([int]::TryParse($state[1].Trim(), [ref]$n)) { $BindIfIndex = $n }
+}
+if ([string]::IsNullOrWhiteSpace($BindGateway) -and $state.Count -gt 2) { $BindGateway = $state[2].Trim() }
+$DnsList = @()
+if (-not [string]::IsNullOrWhiteSpace($DnsServers)) {
+    $DnsList = @($DnsServers.Split(',') | Where-Object { $_ -and $_.Trim().Length -gt 0 } | ForEach-Object { $_.Trim() })
+} elseif ($state.Count -gt 3 -and $state[3].Trim()) {
+    $DnsList = @($state[3].Split(',') | Where-Object { $_ -and $_.Trim().Length -gt 0 } | ForEach-Object { $_.Trim() })
+}
+if ([string]::IsNullOrWhiteSpace($RouteStateFile)) { $RouteStateFile = Join-Path $logDir 'samehost-routes.txt' }
 [Ssh443.Log]::Write("bind ip     : $BindIp  (physical NIC only - TUN/VPN adapter excluded)")
 
 # Resolve the interface index used by IP_UNICAST_IF. A bound source IP alone can
@@ -886,6 +909,49 @@ if ($BindIfIndex -le 0 -and $BindIp -ne '0.0.0.0') {
 }
 if ($BindIfIndex -gt 0) { [Ssh443.UdpGw]::OutIfIndex = $BindIfIndex }
 [Ssh443.Log]::Write("udp nic     : ifIndex $BindIfIndex  (IP_UNICAST_IF - bypass TUN)")
+[Ssh443.Log]::Write("samehost    : gw=$BindGateway dns=$($DnsList -join ',') state=$RouteStateFile")
+
+# --------------------------------------------------------- route guard (v1.9)
+# NetMod installs 0.0.0.0/1 and 128.0.0.0/1 with metric 1 AFTER the tunnel is up.
+# A more specific /32 route always wins, but it must still exist. Re-assert it
+# every few seconds so reconnecting NetMod can never swallow our own IP, gateway
+# or DNS resolver again. Only routes we created are recorded for clean uninstall.
+function Get-SameHostRoutes {
+    $list = New-Object System.Collections.Generic.List[object]
+    if ($BindIp -ne '0.0.0.0') { $list.Add([pscustomobject]@{ Prefix = "$BindIp/32"; Hop = '' }) }
+    if ($BindGateway) { $list.Add([pscustomobject]@{ Prefix = "$BindGateway/32"; Hop = '' }) }
+    foreach ($d in $DnsList) {
+        if ($d -eq $BindIp -or $d -eq $BindGateway) { continue }
+        $list.Add([pscustomobject]@{ Prefix = "$d/32"; Hop = $BindGateway })
+    }
+    return $list
+}
+function Assert-SameHostRoutes {
+    if ($BindIfIndex -le 0) { return }
+    foreach ($r in (Get-SameHostRoutes)) {
+        $wantHop = if ($r.Hop) { $r.Hop } else { '0.0.0.0' }
+        $found = @(Get-NetRoute -DestinationPrefix $r.Prefix -InterfaceIndex $BindIfIndex -ErrorAction SilentlyContinue |
+                   Where-Object { $_.NextHop -eq $wantHop -and [int]$_.RouteMetric -le 1 })
+        if ($found.Count -gt 0) { continue }
+        try {
+            if ($r.Hop) {
+                New-NetRoute -DestinationPrefix $r.Prefix -InterfaceIndex $BindIfIndex `
+                    -NextHop $r.Hop -RouteMetric 1 -ErrorAction Stop | Out-Null
+            } else {
+                New-NetRoute -DestinationPrefix $r.Prefix -InterfaceIndex $BindIfIndex `
+                    -RouteMetric 1 -ErrorAction Stop | Out-Null
+            }
+            $line = "$($r.Prefix)|$BindIfIndex|$wantHop"
+            $have = @()
+            if (Test-Path $RouteStateFile) { $have = @(Get-Content -LiteralPath $RouteStateFile -ErrorAction SilentlyContinue) }
+            if ($have -notcontains $line) { Add-Content -LiteralPath $RouteStateFile -Value $line -Encoding ASCII }
+            [Ssh443.Log]::Write("route guard : added $($r.Prefix) via $wantHop if=$BindIfIndex")
+        } catch {
+            [Ssh443.Log]::Write("route guard : FAILED $($r.Prefix) via $wantHop - $($_.Exception.Message)")
+        }
+    }
+}
+Assert-SameHostRoutes
 
 # ================================================================== sshd binder
 # The SSH service forks a fresh sshd.exe per connection.  Those children open
@@ -897,7 +963,7 @@ if (-not $NoSshdBind) {
         $BindNicDll = Join-Path $PSScriptRoot 'native\bindnic.dll'
     }
     [Ssh443.BindNic]::StartKeeper($BindNicDll)
-    [Ssh443.Log]::Write("sshd binder : v2 active - children injected at CreateProcess; details in " +
+    [Ssh443.Log]::Write("sshd binder : v3 active - children injected while suspended at CreateProcess; details in " +
                         [System.IO.Path]::Combine([System.IO.Path]::GetDirectoryName($BindNicDll), "bindnic.log"))
 }
 
@@ -916,12 +982,18 @@ if ([string]::IsNullOrWhiteSpace($CertThumbprint)) {
 }
 
 # ================================================================== dns for the udp gateway
-if ($UdpGwPort -gt 0 -and [string]::IsNullOrWhiteSpace($UdpGwDns)) {
-    try {
-        $dns = Get-DnsClientServerAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
-               Where-Object { $_.ServerAddresses.Count -gt 0 } | Select-Object -First 1
-        if ($dns) { $UdpGwDns = $dns.ServerAddresses[0] }
-    } catch { }
+# NEVER query the live adapter here: with a TUN connected it returns 10.4.2.2.
+if ($UdpGwPort -gt 0) {
+    if ([string]::IsNullOrWhiteSpace($UdpGwDns) -and $DnsList.Count -gt 0) { $UdpGwDns = $DnsList[0] }
+    if ([string]::IsNullOrWhiteSpace($UdpGwDns)) {
+        if ($state.Count -gt 1) {
+            try {
+                $dns = Get-DnsClientServerAddress -InterfaceIndex ([int]$state[1]) -AddressFamily IPv4 `
+                       -ErrorAction SilentlyContinue | Select-Object -First 1
+                if ($dns -and $dns.ServerAddresses.Count -gt 0) { $UdpGwDns = $dns.ServerAddresses[0] }
+            } catch { }
+        }
+    }
     if ([string]::IsNullOrWhiteSpace($UdpGwDns)) { $UdpGwDns = '1.1.1.1' }
 }
 
@@ -955,9 +1027,14 @@ Write-Host '  Press Ctrl+C to stop.' -ForegroundColor DarkGray
 Write-Host ''
 
 $last = Get-Date
+$lastRoute = Get-Date
 try {
     while ($true) {
         Start-Sleep -Seconds 2
+        if ($RouteGuardInterval -gt 0 -and ((Get-Date) - $lastRoute).TotalSeconds -ge $RouteGuardInterval) {
+            $lastRoute = Get-Date
+            Assert-SameHostRoutes
+        }
         if (((Get-Date) - $last).TotalSeconds -ge $StatusInterval) {
             $last = Get-Date
             [Ssh443.Log]::Write('stats       : ' + [Ssh443.Tunnel]::Stats())
