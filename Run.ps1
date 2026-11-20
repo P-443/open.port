@@ -34,8 +34,102 @@ param(
     [switch] $NoUdpgw,
     [string] $SniHost      = '',
     [string] $CertSubject  = 'CN=ssh443-tunnel',
-    [string] $BindIp       = ''
+    [string] $BindIp       = '',
+    [switch] $Diagnose,
+    [switch] $SameHost,
+    [switch] $ListenLocalOnly,
+    [switch] $UseInject,
+    [switch] $SelfTest
 )
+
+# ------------------------------------------------------------------ diagnose (read-only)
+# -Diagnose must never start a transcript, create a directory, prompt, or change
+# any route/service/process. It exits before all of that.
+if ($Diagnose) {
+    function D-Say ($m, $c = 'Gray') { Write-Host $m -ForegroundColor $c }
+    D-Say '=== Run.ps1 -Diagnose (read-only, no changes) ===' 'Cyan'
+
+    $tunPattern = '(?i)(TAP|Wintun|NetMod|VPN|Tunnel|Virtual|Hyper-V|vEthernet|VMware|VirtualBox|WSL|WireGuard|OpenVPN)'
+
+    D-Say '' 
+    D-Say '[1] TUN / virtual adapters' 'Green'
+    $tun = @(Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object {
+        $_.Name -match $tunPattern -or $_.InterfaceDescription -match $tunPattern
+    })
+    if ($tun.Count -eq 0) { D-Say '  none detected' 'Yellow' }
+    else {
+        $tun | Select-Object Name,InterfaceIndex,Status,InterfaceDescription,MacAddress |
+            Format-Table -AutoSize | Out-String -Width 200 | Write-Host
+    }
+
+    D-Say '[2] /1 routes installed by the TUN client' 'Green'
+    $one = @(Get-NetRoute -DestinationPrefix '0.0.0.0/1','128.0.0.0/1' -ErrorAction SilentlyContinue)
+    if ($one.Count -eq 0) { D-Say '  none detected' 'Yellow' }
+    else {
+        $one | Select-Object DestinationPrefix,NextHop,InterfaceIndex,InterfaceAlias,RouteMetric,InterfaceMetric |
+            Sort-Object DestinationPrefix,InterfaceIndex |
+            Format-Table -AutoSize | Out-String -Width 200 | Write-Host
+    }
+
+    D-Say '[3] primary NIC (same selection logic as the installer)' 'Green'
+    $cands = @(Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object {
+        $_.IPAddress -notlike '127.*' -and
+        $_.IPAddress -notlike '169.254.*' -and
+        $_.PrefixLength -gt 0 -and
+        $_.InterfaceAlias -notmatch $tunPattern
+    })
+    $rts = @(Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue |
+             Where-Object { $_.NextHop -and $_.NextHop -ne '0.0.0.0' -and $_.InterfaceIndex -gt 0 })
+    $primary = $null; $best = [int]::MaxValue
+    foreach ($c in $cands) {
+        $r = $rts | Where-Object { $_.InterfaceIndex -eq $c.InterfaceIndex } | Sort-Object RouteMetric | Select-Object -First 1
+        $m = if ($r) { [int]$r.RouteMetric } else { 9999 }
+        if ($m -lt $best) { $best = $m; $primary = $c; $gw = if ($r) { $r.NextHop } else { '' } }
+    }
+    if ($primary) {
+        [pscustomobject]@{ IPAddress = $primary.IPAddress; InterfaceIndex = $primary.InterfaceIndex;
+                           InterfaceAlias = $primary.InterfaceAlias; Gateway = $gw; DefaultRouteMetric = $best } |
+            Format-List | Out-String -Width 200 | Write-Host
+    } else { D-Say '  no physical NIC detected' 'Yellow' }
+
+    D-Say '[4] sshd processes (parent -> children)' 'Green'
+    $sshd = @(Get-CimInstance Win32_Process -Filter "Name='sshd.exe'" -ErrorAction SilentlyContinue)
+    if ($sshd.Count -eq 0) { D-Say '  no sshd.exe process' 'Yellow' }
+    else {
+        $sshd | Select-Object ProcessId,ParentProcessId,SessionId,CommandLine |
+            Sort-Object ParentProcessId,ProcessId |
+            Format-Table -AutoSize -Wrap | Out-String -Width 200 | Write-Host
+    }
+
+    D-Say '[5] native helper' 'Green'
+    $nativeDir = Join-Path $env:ProgramData 'open.port\native'
+    $dll = Join-Path $nativeDir 'bindnic.dll'
+    if (Test-Path -LiteralPath $dll) {
+        $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $dll).Hash
+        $bytes = [IO.File]::ReadAllBytes($dll)
+        $marker = ([Text.Encoding]::ASCII.GetString($bytes)).Contains('hooks installed (v3)')
+        [pscustomobject]@{ Path = $dll; Length = $bytes.Length; SHA256 = $hash; V3Marker = $marker } |
+            Format-List | Out-String -Width 200 | Write-Host
+        if (-not $marker) { D-Say '  STALE: v3 marker absent - suspended-inject fix is NOT active' 'Red' }
+    } else { D-Say "  MISSING: $dll" 'Red' }
+    $cfg = Join-Path $nativeDir 'bindnic.cfg'
+    if (Test-Path -LiteralPath $cfg) { D-Say "  bindnic.cfg: $((Get-Content -LiteralPath $cfg -Raw) -replace '\r?\n', ' | ')" }
+
+    D-Say '[6] last 50 lines of logs' 'Green'
+    $logs = @(
+        (Join-Path $env:ProgramData 'ssh443\shim-logs\bindnic.log'),
+        (Join-Path $nativeDir 'bindnic.log'),
+        (Join-Path $env:WINDIR 'Temp\bindnic.log'),
+        (Join-Path $env:ProgramData 'ssh443\tunnel.log')
+    )
+    foreach ($l in $logs) {
+        D-Say "  --- $l ---"
+        if (Test-Path -LiteralPath $l) { Get-Content -LiteralPath $l -Tail 50 | ForEach-Object { "  $_" } }
+        else { D-Say '  (not found)' 'Yellow' }
+    }
+    D-Say '=== end of diagnosis ===' 'Cyan'
+    exit 0
+}
 
 $ErrorActionPreference = 'Stop'
 try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch { }
@@ -49,7 +143,7 @@ $WorkDir    = Join-Path $env:ProgramData 'ssh443'
 $LogFile    = Join-Path $WorkDir 'tunnel.log'
 $SetupLog   = Join-Path $WorkDir 'setup.log'
 # Windows build version - its own counter, bumped on every change (1.0 -> 1.1 -> ...)
-$WinVer     = '1.9.2'
+$WinVer     = '2.0'
 
 function Write-Step   ($m) { Write-Host "  [*] $m" -ForegroundColor Cyan }
 function Write-Ok     ($m) { Write-Host "  [v] $m" -ForegroundColor Green }
@@ -179,6 +273,33 @@ if (-not $primaryNic) {
 $BindIp = $primaryNic.IP
 Write-Ok "Primary NIC : $($primaryNic.Alias)  $BindIp  (ifIndex $($primaryNic.Index), gw $($primaryNic.GW))"
 
+# A same-host client can reach 127.0.0.1:443 directly, which removes the listener
+# from the TUN path entirely. It is opt-in (-SameHost / -ListenLocalOnly); remote
+# clients still need the physical NIC address.
+$ListenerIp = if ($SameHost -or $ListenLocalOnly) { '127.0.0.1' } else { $BindIp }
+if ($SameHost -or $ListenLocalOnly) {
+    Write-Ok "Listener    : 127.0.0.1:$Port (local-only; physical NIC $BindIp still used for UDP and routes)"
+} else {
+    Write-Ok "Listener    : $BindIp`:$Port (remote clients allowed)"
+}
+
+function Test-SameHostTun {
+    $virtualPattern = '(?i)(TAP|Wintun|NetMod|VPN|Tunnel|Virtual|Hyper-V|vEthernet|VMware|VirtualBox|WSL|WireGuard|OpenVPN)'
+    $adapters = @(Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object {
+        $_.Name -match $virtualPattern -or $_.InterfaceDescription -match $virtualPattern
+    })
+    if ($adapters.Count -gt 0) { return $true }
+    $tunRoutes = @(Get-NetRoute -DestinationPrefix '0.0.0.0/1','128.0.0.0/1' -ErrorAction SilentlyContinue)
+    return ($tunRoutes.Count -gt 0)
+}
+if (Test-SameHostTun) {
+    if ($UseInject) {
+        Write-Ok 'TUN/VPN detected on this host - sshd injection enabled (-UseInject)'
+    } else {
+        Write-Warn2 'TUN/VPN detected here and -UseInject was NOT passed: sshd children can route outbound TCP back into the tunnel (no internet). Re-run with -UseInject, or use a non-TUN client.'
+    }
+}
+
 # Tunnel443.ps1 runs as SYSTEM at boot, so persist the whole NIC choice next to
 # its log. Line 1 stays the IP for backwards compatibility with older scripts.
 $nicFile     = Join-Path $WorkDir 'primary-ip.txt'
@@ -190,6 +311,249 @@ $DnsCsv      = $DnsServers -join ','
 @($BindIp, "$($primaryNic.Index)", $Gateway, $DnsCsv) | Set-Content -LiteralPath $nicFile -Encoding ASCII
 if (-not (Test-Path $RouteState)) { New-Item -ItemType File -Force -Path $RouteState | Out-Null }
 Write-Ok "Physical DNS  : $DnsCsv  (persisted - not re-read from the TUN adapter)"
+
+# ------------------------------------------------------------------ self test
+# End-to-end proof, not an assumption: TCP + DNS are exercised from the physical
+# NIC and again through the tunnel (local 443 -> sshd -> SOCKS -> outbound).
+# Every network operation has a 5 second deadline. A temporary ssh key is added
+# to authorized_keys only for the duration of the test and always removed.
+if ($SelfTest) {
+    function ST-Say { param($m,$c='Gray') Write-Host $m -ForegroundColor $c }
+    function ST-Fail { param($m) Write-Host "  [x] SELFTEST FAIL: $m" -ForegroundColor Red; exit 1 }
+    function ST-Bail { param($m) $script:stErr = $m; throw 'SELFTEST_FAILED' }
+    function ST-ReadExactly {
+        param($Stream,[int]$Count)
+        $buf = New-Object byte[] $Count
+        $off = 0
+        while ($off -lt $Count) {
+            $n = $Stream.Read($buf,$off,$Count-$off)
+            if ($n -le 0) { throw 'stream closed' }
+            $off += $n
+        }
+        return ,$buf
+    }
+    function ST-Tcp {
+        param([string]$Ip,[int]$Port,[string]$LocalIp,[int]$Ms=5000)
+        $c = $null
+        try {
+            # .NET Framework TcpClient has no Bind(); the local endpoint must be
+            # supplied to the constructor instead.
+            if ($LocalIp) {
+                $localEp = New-Object Net.IPEndPoint ([Net.IPAddress]::Parse($LocalIp)), 0
+                $c = New-Object Net.Sockets.TcpClient -ArgumentList $localEp
+            } else {
+                $c = New-Object Net.Sockets.TcpClient
+            }
+            $t = $c.ConnectAsync($Ip,$Port)
+            if (-not $t.Wait($Ms)) { return $false }
+            return $c.Connected
+        } catch { return $false } finally { if ($c) { $c.Close() } }
+    }
+    function ST-DnsQueryBytes {
+        param([string]$Name)
+        $q = New-Object 'System.Collections.Generic.List[byte]'
+        $q.Add([byte]0x12); $q.Add([byte]0x34)   # id
+        $q.Add([byte]0x01); $q.Add([byte]0x00)   # recursion desired
+        $q.Add([byte]0x00); $q.Add([byte]0x01)   # QDCOUNT = 1
+        $q.Add([byte]0); $q.Add([byte]0); $q.Add([byte]0)
+        $q.Add([byte]0); $q.Add([byte]0); $q.Add([byte]0)   # AN/NS/AR = 0
+        foreach ($label in ($Name.Split('.'))) {
+            $b = [Text.Encoding]::ASCII.GetBytes($label)
+            $q.Add([byte]$b.Length)
+            foreach ($x in $b) { $q.Add([byte]$x) }
+        }
+        $q.Add([byte]0)                          # root label
+        $q.Add([byte]0); $q.Add([byte]1)         # QTYPE A
+        $q.Add([byte]0); $q.Add([byte]1)         # QCLASS IN
+        return $q.ToArray()
+    }
+    function ST-DnsOk {
+        param([byte[]]$Response)
+        if ($Response.Length -lt 12) { return $false }
+        $ancount = ($Response[6] -shl 8) -bor $Response[7]
+        $rcode   = $Response[3] -band 0x0F
+        return (($rcode -eq 0) -and ($ancount -gt 0))
+    }
+    function ST-DnsUdp {
+        param([string]$Server,[string]$Name,[string]$LocalIp,[int]$Ms=5000)
+        $u = $null
+        try {
+            $q = ST-DnsQueryBytes $Name
+            $u = New-Object Net.Sockets.UdpClient
+            if ($LocalIp) { $u.Client.Bind((New-Object Net.IPEndPoint([Net.IPAddress]::Parse($LocalIp),0))) }
+            $u.Client.ReceiveTimeout = $Ms
+            [void]$u.Send($q,$q.Length,$Server,53)
+            $ep = New-Object Net.IPEndPoint([Net.IPAddress]::Any,0)
+            $r = $u.Receive([ref]$ep)
+            return (ST-DnsOk $r)
+        } catch { return $false } finally { if ($u) { $u.Close() } }
+    }
+    function ST-DnsTcp {
+        param($Stream,[string]$Name)
+        $q = ST-DnsQueryBytes $Name
+        $len = New-Object byte[] 2
+        $len[0] = [byte](($q.Length -shr 8) -band 0xFF)
+        $len[1] = [byte]($q.Length -band 0xFF)
+        $Stream.Write($len,0,2)
+        $Stream.Write($q,0,$q.Length)
+        $h = ST-ReadExactly $Stream 2
+        $n = ($h[0] -shl 8) -bor $h[1]
+        if ($n -lt 12 -or $n -gt 4096) { return $false }
+        $r = ST-ReadExactly $Stream $n
+        return (ST-DnsOk $r)
+    }
+    function ST-SocksConnect {
+        param([string]$ProxyIp,[int]$ProxyPort,[string]$Target,[int]$TargetPort,[int]$Ms=5000)
+        $c = $null
+        try {
+            $c = New-Object Net.Sockets.TcpClient
+            $t = $c.ConnectAsync($ProxyIp,$ProxyPort)
+            if (-not $t.Wait($Ms)) { return $null }
+            $s = $c.GetStream(); $s.ReadTimeout=$Ms; $s.WriteTimeout=$Ms
+            $s.Write([byte[]]@(5,1,0),0,3)
+            $g = ST-ReadExactly $s 2
+            if ($g[0] -ne 5 -or $g[1] -ne 0) { return $null }
+            $tb = [Text.Encoding]::ASCII.GetBytes($Target)
+            $req = New-Object byte[] (5 + $tb.Length + 2)
+            $req[0]=[byte]5; $req[1]=[byte]1; $req[2]=[byte]0; $req[3]=[byte]3
+            $req[4]=[byte]$tb.Length
+            [Array]::Copy($tb,0,$req,5,$tb.Length)
+            $req[5+$tb.Length]=[byte](($TargetPort -shr 8) -band 0xFF)
+            $req[6+$tb.Length]=[byte]($TargetPort -band 0xFF)
+            $s.Write($req,0,$req.Length)
+            $rep = ST-ReadExactly $s 4
+            if ($rep[1] -ne 0) { return $null }
+            if ($rep[3] -eq 1) { [void](ST-ReadExactly $s 4) }
+            elseif ($rep[3] -eq 4) { [void](ST-ReadExactly $s 16) }
+            elseif ($rep[3] -eq 3) { $lb=ST-ReadExactly $s 1; [void](ST-ReadExactly $s $lb[0]) }
+            [void](ST-ReadExactly $s 2)   # BND.PORT - otherwise it is read as the DNS length
+            return $s
+        } catch { if ($c) { $c.Close() }; return $null }
+    }
+
+    ST-Say '=== Run.ps1 -SelfTest (5s deadline per check) ===' 'Cyan'
+    $stErr = $null
+
+    # 1. The native helper must be the pinned, verified v3 build.
+    $dllPath = Join-Path $env:ProgramData 'open.port\native\bindnic.dll'
+    if (-not (Test-Path -LiteralPath $dllPath)) {
+        ST-Fail "bindnic.dll is MISSING ($dllPath). Re-run Run.ps1 -UseInject with internet access."
+    }
+    $dllHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $dllPath).Hash.ToLower()
+    $wantDll = '482a067b0d1e1fa499abf52bfad19fafeb36bf52f890689779dd747f3ccb2593'
+    if ($dllHash -ne $wantDll) {
+        ST-Fail "bindnic.dll is STALE: SHA256 $dllHash, expected $wantDll - loop protection is NOT active"
+    }
+    if (-not ([Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes($dllPath))).Contains('hooks installed (v3)')) {
+        ST-Fail 'bindnic.dll has no v3 marker - the suspended-inject fix is NOT active'
+    }
+    ST-Say "  [v] native helper verified  $dllHash" 'Green'
+    if (-not $UseInject) {
+        ST-Fail 'bindnic.dll is verified but -UseInject was not passed, so sshd injection is disabled and outbound TCP can loop'
+    }
+    ST-Say '  [v] -UseInject present' 'Green'
+
+    # 2. With TUN up, the /32 pins must exist on the physical interface.
+    $tunRoutes = @(Get-NetRoute -DestinationPrefix '0.0.0.0/1','128.0.0.0/1' -ErrorAction SilentlyContinue)
+    ST-Say ("  TUN /1 routes         : {0}" -f $(if ($tunRoutes.Count) { 'present' } else { 'not present' }))
+    if ($tunRoutes.Count -gt 0) {
+        $pins = @("$BindIp/32", "$Gateway/32") + @($DnsServers | ForEach-Object { "$_/32" })
+        foreach ($p in ($pins | Where-Object { $_ -notmatch '^/$|^\s*/32$' } | Select-Object -Unique)) {
+            $hit = @(Get-NetRoute -DestinationPrefix $p -ErrorAction SilentlyContinue |
+                     Where-Object { $_.InterfaceIndex -eq $primaryNic.Index })
+            if ($hit.Count -eq 0) {
+                ST-Fail "route pin $p is missing on physical interface $($primaryNic.Index). Loop hint: TUN default routes can capture sshd's outbound sockets."
+            }
+        }
+        ST-Say '  [v] route pins present on the physical NIC' 'Green'
+    }
+
+    # 3. Direct path: TCP and DNS from the physical NIC.
+    $dnsIp = $DnsServers[0]
+    if (-not (ST-Tcp '1.1.1.1' 443 $BindIp)) {
+        ST-Fail 'physical-NIC TCP to 1.1.1.1:443 did not complete within 5s'
+    }
+    ST-Say ("  [v] physical TCP       : {0} -> 1.1.1.1:443" -f $BindIp) 'Green'
+    if (-not (ST-DnsUdp $dnsIp 'example.com' $BindIp)) {
+        ST-Fail "DNS via physical NIC $dnsIp did not answer within 5s"
+    }
+    ST-Say ("  [v] physical DNS       : example.com via {0}" -f $dnsIp) 'Green'
+
+    # 4. Tunnel path: temporary key, ssh -D, then TCP and DNS through SOCKS5.
+    $openssh   = Join-Path $env:WINDIR 'System32\OpenSSH'
+    $sshExe    = Join-Path $openssh 'ssh.exe'
+    $keygenExe = Join-Path $openssh 'ssh-keygen.exe'
+    if (-not (Test-Path $sshExe) -or -not (Test-Path $keygenExe)) {
+        ST-Fail 'OpenSSH client (ssh.exe / ssh-keygen.exe) was not found'
+    }
+    $stUser    = if ($User -match '\\') { $User.Split('\')[-1] } else { $User }
+    $akFile    = Join-Path $env:ProgramData ("ssh\authorized_keys\" + $stUser)
+    $akDirPath = Split-Path -Parent $akFile
+    $tmpDir    = Join-Path $env:TEMP ('ssh443-selftest-' + [guid]::NewGuid().ToString('N'))
+    $akExisted = Test-Path -LiteralPath $akFile
+    $savedAk   = $null
+    $sshProc   = $null
+    try {
+        New-Item -ItemType Directory -Force -Path $tmpDir | Out-Null
+        $keyPath = Join-Path $tmpDir 'id'
+        # PowerShell drops an empty native argument; '""' is required so
+        # ssh-keygen really receives an empty passphrase.
+        & $keygenExe -q -t ed25519 -N '""' -f $keyPath 2>&1 | Out-Null
+        if (-not (Test-Path "$keyPath.pub")) { ST-Bail 'ssh-keygen could not create a temporary test key' }
+        if (-not (Test-Path $akDirPath)) { New-Item -ItemType Directory -Force -Path $akDirPath | Out-Null }
+        if ($akExisted) { $savedAk = Get-Content -LiteralPath $akFile -Raw }
+        $pub = (Get-Content -LiteralPath "$keyPath.pub" -Raw).Trim()
+        Add-Content -LiteralPath $akFile -Value $pub -Encoding ASCII
+
+        $socksPort = 45000 + (Get-Random -Maximum 5000)
+        $errFile   = Join-Path $tmpDir 'ssh.err'
+        $sshArgs = @(
+            '-i', "`"$keyPath`"", '-o','BatchMode=yes', '-o','StrictHostKeyChecking=no',
+            '-o','UserKnownHostsFile=NUL', '-o','ExitOnForwardFailure=yes', '-o','ConnectTimeout=5',
+            '-D', "127.0.0.1:$socksPort", '-N', '-p', "$Port", "`"$User@$ListenerIp`""
+        )
+        $sshProc = Start-Process -FilePath $sshExe -ArgumentList $sshArgs -PassThru `
+                       -WindowStyle Hidden -RedirectStandardError $errFile
+        $up = $false
+        for ($i = 0; $i -lt 10; $i++) {
+            Start-Sleep -Milliseconds 500
+            if (Get-NetTCPConnection -LocalPort $socksPort -State Listen -ErrorAction SilentlyContinue) { $up = $true; break }
+        }
+        $loopHint = ' Loop hint: with a TUN client on this host, sshd children route outbound TCP back into the tunnel unless -UseInject is active and bindnic.dll v3 is verified.'
+        if (-not $up) {
+            $detail = if (Test-Path $errFile) { ((Get-Content $errFile -Raw) -replace '\s+',' ').Trim() } else { 'no ssh diagnostic output' }
+            ST-Bail "SOCKS session through the tunnel did not open within 5s ($detail).$loopHint"
+        }
+        $s1 = ST-SocksConnect '127.0.0.1' $socksPort '1.1.1.1' 443
+        if (-not $s1) { ST-Bail "outbound TCP via the tunnel to 1.1.1.1:443 did not complete within 5s.$loopHint" }
+        ST-Say '  [v] tunnel TCP         : 1.1.1.1:443 via SOCKS' 'Green'
+
+        $s2 = ST-SocksConnect '127.0.0.1' $socksPort $dnsIp 53
+        if (-not $s2) {
+            ST-Bail "SOCKS CONNECT to $dnsIp`:53 through the tunnel failed within 5s.$loopHint"
+        }
+        $dnsOk = $false
+        $dnsWhy = ''
+        try { $dnsOk = ST-DnsTcp $s2 'example.com' } catch { $dnsWhy = $_.Exception.Message }
+        if (-not $dnsOk) {
+            ST-Bail "DNS answer via the tunnel ($dnsIp`:53) was missing or invalid within 5s ($dnsWhy).$loopHint"
+        }
+        ST-Say ("  [v] tunnel DNS         : example.com via {0}" -f $dnsIp) 'Green'
+    } catch {
+        if (-not $stErr) { $stErr = $_.Exception.Message }
+    } finally {
+        if ($sshProc -and -not $sshProc.HasExited) { Stop-Process -Id $sshProc.Id -Force -ErrorAction SilentlyContinue }
+        if ($akExisted) {
+            Set-Content -LiteralPath $akFile -Value $savedAk -Encoding ASCII -NoNewline
+        } else {
+            Remove-Item -LiteralPath $akFile -Force -ErrorAction SilentlyContinue
+        }
+        Remove-Item -LiteralPath $tmpDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    if ($stErr) { ST-Fail $stErr }
+    ST-Say '=== SELFTEST PASS ===' 'Green'
+    exit 0
+}
 
 if ($primaryNic.Index -gt 0 -and $BindIp -ne '0.0.0.0') {
     # /32 exceptions beat NetMod's 0.0.0.0/1 and 128.0.0.0/1 routes. They are
@@ -214,75 +578,141 @@ if ($primaryNic.Index -gt 0 -and $BindIp -ne '0.0.0.0') {
 # fetches the three .ps1 files) continues to work unchanged.
 $NativeDir  = Join-Path $RootDir 'native'
 if (-not (Test-Path $NativeDir)) { New-Item -ItemType Directory -Force -Path $NativeDir | Out-Null }
-# The injected DLL also runs as the unprivileged SSH user. Grant Users write on
-# this folder so bindnic.log is always written next to the DLL (no silent loss).
-try { & icacls.exe $NativeDir /grant '*S-1-5-32-545:(OI)(CI)M' /T 2>&1 | Out-Null } catch { }
+# native\ holds executable code. Only SYSTEM and Administrators may write here.
+# Users:Modify on this folder would let any local account replace bindnic.dll.
+try {
+    & icacls.exe $NativeDir /inheritance:r /remove:g '*S-1-5-32-545' /T 2>&1 | Out-Null
+    & icacls.exe $NativeDir /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' /T 2>&1 | Out-Null
+} catch { }
 $BindNicDll = Join-Path $NativeDir 'bindnic.dll'
 $InjectExe  = Join-Path $NativeDir 'inject.exe'
-$BindNicLog = Join-Path $NativeDir 'bindnic.log'
-# Use the refs/heads path first: the short branch URL is a CDN that can keep
-# returning an older binary after a push. VERIFY the bytes contain the v3
-# marker - an unverified cached DLL silently disabled the suspended-inject fix
-# and left no bindnic.log (seen on the first v1.9 run).
-$RawBase    = 'https://raw.githubusercontent.com/P-443/open.port/refs/heads/neteg/native'
-$AltBase    = 'https://raw.githubusercontent.com/P-443/open.port/neteg/native'
-$V3Marker   = 'hooks installed (v3)'
-function Test-NativeFile {
-    param([string]$Path, [string]$WantMarker)
-    if (-not (Test-Path -LiteralPath $Path)) { return $false }
-    try {
-        $b = [IO.File]::ReadAllBytes($Path)
-        if (-not $WantMarker) { return $true }
-        return ([Text.Encoding]::ASCII.GetString($b)).Contains($WantMarker)
-    } catch { return $false }
+
+# The shim writes its log from inside sshd children (unprivileged SSH user) and
+# from the SYSTEM-owned sshd service. Give it a DATA-ONLY directory outside the
+# code path: no DLL/EXE/PS1 is ever loaded from here. bindnic.cfg line 3 is the
+# path the native DLL itself opens.
+$ShimLogDir = Join-Path $WorkDir 'shim-logs'
+if (-not (Test-Path $ShimLogDir)) { New-Item -ItemType Directory -Force -Path $ShimLogDir | Out-Null }
+try {
+    & icacls.exe $ShimLogDir /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-32-545:(OI)(CI)M' /T 2>&1 | Out-Null
+} catch { }
+$BindNicLog = Join-Path $ShimLogDir 'bindnic.log'
+# Pinned native helper. The expected hashes are literals in THIS file - they
+# are not fetched from the same host as the binaries. URLs address an immutable
+# commit, so a branch/CDN cache can never serve a different build.
+$PinnedCommit = 'e5f5925c3cdca208c2201e4dc400c0b726c9cf4d'
+$PinnedSha = @{
+    'bindnic.dll' = '482a067b0d1e1fa499abf52bfad19fafeb36bf52f890689779dd747f3ccb2593'
+    'inject.exe'  = '41aefe9cdad60289813a2dc7a72846cf7e106f4da39a7a5cb23d0ae7d8fe8757'
 }
-foreach ($n in 'bindnic.dll','inject.exe') {
-    $dst  = Join-Path $NativeDir $n
-    $want = if ($n -eq 'bindnic.dll') { $V3Marker } else { '' }
-    $got  = $false
+$PinnedB64Sha = 'b7145d564042e88ab0e1a49dd5b43357885323681060a806af1e107a3cf35add'
+$NativeBase   = "https://raw.githubusercontent.com/P-443/open.port/$PinnedCommit/native"
+$V3Marker     = 'hooks installed (v3)'
+function Get-Sha256 { param([string]$Path) (Get-FileHash -Algorithm SHA256 -LiteralPath $Path).Hash.ToLower() }
+function Test-V3Marker {
+    param([string]$Path)
+    try { return ([Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes($Path))).Contains($V3Marker) } catch { return $false }
+}
+
+$NativeHelperOk = $true
+foreach ($n in @('bindnic.dll','inject.exe')) {
+    $dst = Join-Path $NativeDir $n
+    $expect = $PinnedSha[$n]
+    $failures = New-Object System.Collections.Generic.List[string]
+    $got = $false
     for ($attempt = 1; $attempt -le 3 -and -not $got; $attempt++) {
-        foreach ($base in @($RawBase, $AltBase)) {
-            $tmp = Join-Path $env:TEMP ("ssh443-native-$n-$attempt")
-            try {
-                Invoke-WebRequest -Uri "$base/$n" -OutFile $tmp -UseBasicParsing -TimeoutSec 45 -ErrorAction Stop
-                if (Test-NativeFile $tmp $want) { Copy-Item $tmp $dst -Force; $got = $true; break }
-            } catch { }
-            finally { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
-        }
+        $tmp = Join-Path $env:TEMP ("ssh443-$n-$attempt")
+        try {
+            Invoke-WebRequest -Uri "$NativeBase/$n" -OutFile $tmp -UseBasicParsing -TimeoutSec 60 -ErrorAction Stop
+            $actual = Get-Sha256 $tmp
+            if ($actual -ne $expect) {
+                $failures.Add("attempt $attempt : SHA256 mismatch from $NativeBase/$n - expected $expect, got $actual")
+            } elseif ($n -eq 'bindnic.dll' -and -not (Test-V3Marker $tmp)) {
+                $failures.Add("attempt $attempt : hash matched but v3 marker '$V3Marker' is absent")
+            } else {
+                Copy-Item $tmp $dst -Force
+                $got = $true
+            }
+        } catch {
+            $failures.Add("attempt $attempt : download from $NativeBase/$n failed - $($_.Exception.Message)")
+        } finally { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
         if (-not $got) { Start-Sleep -Milliseconds 750 }
     }
-    # Fallback for the DLL only: a plain-text base64 copy downloads reliably
-    # even where a binary .dll GET is blocked, cached stale, or quarantined.
-    # The installer already proves text downloads from this host work.
-    if ($n -eq 'bindnic.dll' -and -not $got -and -not (Test-NativeFile $dst $want)) {
-        foreach ($base in @($RawBase, $AltBase)) {
-            try {
-                $c = (Invoke-WebRequest -Uri "$base/bindnic.b64" -UseBasicParsing -TimeoutSec 60 -ErrorAction Stop).Content
-                if ($c -is [byte[]]) { $c = [Text.Encoding]::ASCII.GetString($c) }
+
+    # Text fallback for the DLL: downloaded and decoded locally, then held to
+    # the SAME pinned SHA256. A mismatch is refused, never silently accepted.
+    if ($n -eq 'bindnic.dll' -and -not $got) {
+        try {
+            $c = (Invoke-WebRequest -Uri "$NativeBase/bindnic.b64" -UseBasicParsing -TimeoutSec 90 -ErrorAction Stop).Content
+            if ($c -is [byte[]]) { $c = [Text.Encoding]::ASCII.GetString($c) }
+            $b64Hash = ([Security.Cryptography.SHA256]::Create().ComputeHash([Text.Encoding]::UTF8.GetBytes(($c -replace '\s',''))))
+            $b64Hex  = [BitConverter]::ToString($b64Hash).Replace('-','').ToLower()
+            if ($b64Hex -ne $PinnedB64Sha) {
+                $failures.Add("base64 fallback : SHA256 mismatch - expected $PinnedB64Sha, got $b64Hex")
+            } else {
                 $bytes = [Convert]::FromBase64String(($c -replace '\s',''))
-                [IO.File]::WriteAllBytes($dst, $bytes)
-                if (Test-NativeFile $dst $want) { $got = $true; break }
-            } catch { }
-        }
+                $tmpDll = Join-Path $env:TEMP 'ssh443-bindnic-decoded.dll'
+                [IO.File]::WriteAllBytes($tmpDll, $bytes)
+                $actual = Get-Sha256 $tmpDll
+                if ($actual -ne $expect) {
+                    $failures.Add("base64 fallback : decoded SHA256 mismatch - expected $expect, got $actual")
+                } elseif (-not (Test-V3Marker $tmpDll)) {
+                    $failures.Add("base64 fallback : decoded DLL has no v3 marker")
+                } else {
+                    Copy-Item $tmpDll $dst -Force
+                    $got = $true
+                }
+                Remove-Item $tmpDll -Force -ErrorAction SilentlyContinue
+            }
+        } catch { $failures.Add("base64 fallback : $($_.Exception.Message)") }
     }
-    if ($got) { Write-Ok "Downloaded native/$n (verified)" }
-    elseif (Test-NativeFile $dst $want) { Write-Ok "Cached native/$n is v3 (verified)" }
-    elseif (Test-Path $dst) { Write-Warn2 "Cached $n is STALE - suspended-inject fix NOT active" }
-    else { Write-Warn2 "Could not download $n - TUN loop protection OFF" }
+
+    if ($got) { Write-Ok "Downloaded native/$n (SHA256=$expect)" }
+    elseif (Test-Path $dst) {
+        $cached = Get-Sha256 $dst
+        if ($cached -eq $expect) { Write-Ok "Cached native/$n verified (SHA256=$cached)" }
+        else {
+            $NativeHelperOk = $false
+            Write-Err2 "REFUSED: $dst has SHA256 $cached, expected $expect - it will NOT be used"
+        }
+    } else {
+        $NativeHelperOk = $false
+        Write-Err2 "REFUSED: $n is missing and no verified copy could be downloaded"
+    }
+    foreach ($f in $failures) { Write-Warn2 "  reason: $f" }
 }
-if (Test-Path $BindNicDll) {
+
+# Report (do not remediate) antivirus quarantine. No exclusions are added.
+try {
+    $threats = @(Get-MpThreatDetection -ErrorAction Stop | Where-Object {
+        $r = ($_.Resources -join ' ')
+        $r -match 'bindnic|inject\.exe|open\.port'
+    })
+    if ($threats.Count -gt 0) {
+        Write-Err2 "Defender quarantine detected for our native helper ($($threats.Count) detection(s))."
+        Write-Warn2 'Add an exclusion manually if you trust this repository; this script never adds exclusions.'
+        $threats | Select-Object -First 5 InitialDetectionTime,ThreatID,Resources | Format-List | Out-String -Width 160 | Write-Host
+    }
+} catch {
+    Write-Warn2 "Defender threat detection unavailable: $($_.Exception.Message)"
+}
+
+if (-not $UseInject) {
+    Write-Ok 'sshd injection disabled (default) - pass -UseInject only for a TUN client on this host'
+} elseif (-not ($NativeHelperOk -and (Test-Path $BindNicDll))) {
+    Write-Err2 '-UseInject requested but bindnic.dll is missing or failed hash verification; loop protection is NOT active'
+} else {
     $cfg = Join-Path $NativeDir 'bindnic.cfg'
     @($BindIp, "$($primaryNic.Index)", $BindNicLog) | Set-Content -LiteralPath $cfg -Encoding ASCII
     Write-Ok "sshd binder config : bind=$BindIp if=$($primaryNic.Index) log=$BindNicLog"
-    # Immediate injection into the already running sshd service.  The SYSTEM
-    # tunnel keeper takes care of the per-connection children from then on.
     if (Test-Path $InjectExe) {
         Get-Process sshd -ErrorAction SilentlyContinue | ForEach-Object {
             & $InjectExe $_.Id $BindNicDll 2>&1 | Out-Null
         }
+        Write-Ok 'sshd binder : existing sshd processes injected; keeper enabled in Tunnel443.ps1'
+    } else {
+        Write-Warn2 'inject.exe unavailable - only the Tunnel443 keeper will inject new sshd children'
     }
-} else {
-    Write-Warn2 'sshd NIC shim unavailable - TUN loop protection OFF'
 }
 
 Write-Host ""
@@ -441,6 +871,7 @@ $hostKeyDefs = @(
     @{ t = 'ed25519'; f = 'ssh_host_ed25519_key'; extra = @() }
 )
 $hostKeyPaths = @()
+$createdFiles = @()   # exact files WE generated, for a precise uninstall
 foreach ($hk in $hostKeyDefs) {
     $kp = Join-Path $sshDir $hk.f
     $need = $true
@@ -455,8 +886,11 @@ foreach ($hk in $hostKeyDefs) {
             try { & $keygenExe @kgArgs 2>&1 | ForEach-Object { Write-Host "      $_" -ForegroundColor DarkGray } } catch { }
         }
     }
-    if (Test-Path $kp) { $hostKeyPaths += $kp }
+    if (Test-Path $kp) { $hostKeyPaths += $kp; if ($need) { $createdFiles += $kp } }
 }
+# Record only files this installer actually created so uninstall never deletes
+# a pre-existing host key belonging to another setup.
+Set-Content -LiteralPath (Join-Path $WorkDir 'installed-files.txt') -Value $createdFiles -Encoding ASCII
 if ($hostKeyPaths.Count -eq 0) { Write-Err2 'OpenSSH Server : no host keys could be created - sshd cannot start' }
 
 # Windows sshd refuses to use host keys that any principal other than
@@ -653,15 +1087,10 @@ if (Start-SshdService) {
 }
 
 # ------------------------------------------------------------------ 2. ssh banner
-Write-Step 'SSH banner : writing'
-$Server_Message = '<div><span style="color: #ff0000">[C1]</span><span style="color: #ff0600">[C1]</span><span style="color: #ff0b00">[C1]</span><span style="color: #ff1100">[C1]</span><span style="color: #ff1600">[C1]</span><span style="color: #ff1c00">[C1]</span><span style="color: #ff2100">[C1]</span><span style="color: #ff2700">[C1]</span><span style="color: #ff2c00">[C1]</span><span style="color: #ff3200">[C1]</span><span style="color: #ff3700">[C1]</span><span style="color: #ff3d00">[C1]</span><span style="color: #ff4200">[C2]</span><span style="color: #ff4800">[C3]</span><span style="color: #ff4d00">[C4]</span><span style="color: #ff5300">[C5]</span><span style="color: #ff5800">[C6]</span><span style="color: #ff5e00">[C7]</span><span style="color: #ff6300">[C8]</span><span style="color: #ff6900">[C2]</span></div><div></div><div><span style="color: #ff6e00">D</span><span style="color: #ff7400">e</span><span style="color: #ff7900">v</span><span style="color: #ff7f00">e</span><span style="color: #ff8500">l</span><span style="color: #ff8a00">o</span><span style="color: #ff9000">p</span><span style="color: #ff9500">e</span><span style="color: #ff9b00">r</span><span style="color: #ffa000"> </span><span style="color: #ffa600">:</span><span style="color: #ffac00"> </span><span style="color: #ffb100"> </span><span style="color: #ffb700">l</span><span style="color: #ffbc00">_</span><span style="color: #ffc200">s</span><span style="color: #ffc700">_</span><span style="color: #ffcd00">I</span><span style="color: #ffd200">_</span><span style="color: #ffd800">I</span><span style="color: #ffde00">.</span><span style="color: #ffe300">t</span><span style="color: #ffe900">.</span><span style="color: #ffee00">m</span><span style="color: #fff400">e</span></div><div></div><div><span style="color: #fff900">C</span><span style="color: #ffff00">H</span><span style="color: #f4ff00">A</span><span style="color: #eaff00">N</span><span style="color: #dfff00">N</span><span style="color: #d5ff00">E</span><span style="color: #caff00">L</span><span style="color: #bfff00"> </span><span style="color: #b5ff00">:</span><span style="color: #aaff00"> </span><span style="color: #9fff00">D</span><span style="color: #95ff00">_</span><span style="color: #8aff00">S</span><span style="color: #80ff00">_</span><span style="color: #75ff00">D</span><span style="color: #6aff00">_</span><span style="color: #60ff00">C</span><span style="color: #55ff00">.</span><span style="color: #4aff00">t</span><span style="color: #40ff00">.</span><span style="color: #35ff00">m</span><span style="color: #2bff00">e</span></div><div></div><div><span style="color: #20ff00">S</span><span style="color: #15ff00">t</span><span style="color: #0bff00">a</span><span style="color: #00ff00">t</span><span style="color: #00ff0b">u</span><span style="color: #00ff16">s</span><span style="color: #00ff21">:</span><span style="color: #00ff2c"> </span><span style="color: #00ff37">s</span><span style="color: #00ff43">u</span><span style="color: #00ff4e">c</span><span style="color: #00ff59">c</span><span style="color: #00ff64">e</span><span style="color: #00ff6f">s</span><span style="color: #00ff7a">s</span></div><div></div><div><span style="color: #00ff85">S</span><span style="color: #00ff90">u</span><span style="color: #00ff9b">p</span><span style="color: #00ffa6">p</span><span style="color: #00ffb1">o</span><span style="color: #00ffbc">r</span><span style="color: #00ffc8">t</span><span style="color: #00ffd3"> </span><span style="color: #00ffde">:</span><span style="color: #00ffe9"> </span><span style="color: #00fff4">U</span><span style="color: #00ffff">D</span><span style="color: #00f4ff">P</span><span style="color: #00e9ff">G</span><span style="color: #00deff">W</span><span style="color: #00d3ff"> </span><span style="color: #00c8ff">/</span><span style="color: #00bcff"> </span><span style="color: #00b1ff">G</span><span style="color: #00a6ff">a</span><span style="color: #009bff">m</span><span style="color: #0090ff">e</span><span style="color: #0085ff"> </span><span style="color: #007aff">&</span><span style="color: #006fff"> </span><span style="color: #0064ff">V</span><span style="color: #0059ff">i</span><span style="color: #004eff">d</span><span style="color: #0043ff">e</span><span style="color: #0037ff">o</span><span style="color: #002cff"> </span><span style="color: #0021ff">c</span><span style="color: #0016ff">a</span><span style="color: #000bff">l</span><span style="color: #0000ff">l</span></div>'
-$Server_Message = $Server_Message.Replace('[C1]',[string][char]0x3164).Replace('[C2]',[string][char]0x02D7).Replace('[C3]',[string][char]0x02CF).Replace('[C4]',[string][char]0x02CB).Replace('[C5]',[string][char]0x26A1).Replace('[C6]',[string][char]0xFE0E).Replace('[C7]',[string][char]0x02CE).Replace('[C8]',[string][char]0x02CA)
-
-$bannerFile = Join-Path $sshDir 'banner.txt'
-[System.IO.File]::WriteAllText($bannerFile, $Server_Message, (New-Object System.Text.UTF8Encoding($false)))
-Set-SshdOption -Config $sshdConfig -Name 'Banner' -Value $bannerFile
-if (-not (Start-SshdService)) { Write-Warn2 'OpenSSH Server : sshd did not reload the banner (sshd not running)' }
-Write-Ok "SSH banner : $bannerFile"
+Write-Step 'SSH banner : removing branding'
+Remove-SshdOption -Config $sshdConfig -Name 'Banner'
+Remove-Item (Join-Path $sshDir 'banner.txt') -Force -ErrorAction SilentlyContinue
+Write-Ok 'SSH banner : removed (no channel/branding banners)'
 
 # ------------------------------------------------------------------ 3. user
 Write-Step "User account : $User"
@@ -807,7 +1236,7 @@ for ($i = 0; $i -lt 20; $i++) {
 if (Test-Path $LogFile) { Remove-Item $LogFile -Force -ErrorAction SilentlyContinue }
 
 $tunnelPs = Join-Path $RootDir 'Tunnel443.ps1'
-$argList = @(
+$argParts = @(
     '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden',
     '-File', "`"$tunnelPs`"",
     '-Port', $Port, '-TargetPort', $SshPort, '-CertSubject', "`"$CertSubject`"",
@@ -815,8 +1244,11 @@ $argList = @(
     '-LogFile', "`"$LogFile`"", '-SniHost', "`"$SniHost`"",
     '-BindIp', "`"$BindIp`"", '-BindIfIndex', $primaryNic.Index,
     '-BindGateway', "`"$Gateway`"", '-DnsServers', "`"$DnsCsv`"",
+    '-ListenerIp', "`"$ListenerIp`"",
     '-RouteStateFile', "`"$RouteState`"", '-BindNicDll', "`"$BindNicDll`""
-) -join ' '
+)
+if ($UseInject) { $argParts += '-UseInject' }
+$argList = $argParts -join ' '
 
 $action    = New-ScheduledTaskAction -Execute (Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe') -Argument $argList
 $trigger   = New-ScheduledTaskTrigger -AtStartup
@@ -851,7 +1283,7 @@ if (Test-Path $LogFile) {
 }
 if ($ok -and $bindOk) {
     $owner = (Get-Process -Id $l.OwningProcess -ErrorAction SilentlyContinue).ProcessName
-    Write-Ok "Listening on $BindIp`:$Port (process: $owner)  ->  127.0.0.1:$SshPort"
+    Write-Ok "Listening on $ListenerIp`:$Port (process: $owner)  ->  127.0.0.1:$SshPort"
 } else {
     Write-Err2 "tunnel did not come up on port $Port - check $LogFile"
     if (Test-Path $LogFile) { Get-Content $LogFile -Tail 20 | ForEach-Object { Write-Host "      $_" -ForegroundColor DarkGray } }
@@ -883,10 +1315,9 @@ $chCheck  = [string][char]0x221A                 # check mark
 Write-Host ''
 Write-Host '  ------------------------------------------------------------------'
 Write-Host '  ========== SSH Account ==========' -ForegroundColor Green
-Write-Host ("  {0} CHANNEL URL:- D_S_D_C1.T.ME" -f $chBullet) -ForegroundColor Yellow
 Write-Host ("  {0} VPS Country:- {1}" -f $chBullet, $countryLabel) -ForegroundColor Yellow
 Write-Host ("  {0} IP Address:- {1}" -f $chBullet, $ip) -ForegroundColor Yellow
-Write-Host ("  {0} Local NIC IP:- {1}  (use this in NetMod on the same PC)" -f $chBullet, $BindIp) -ForegroundColor Yellow
+Write-Host ("  {0} Local NIC IP:- {1}  (physical NIC; UDP and routes are pinned here)" -f $chBullet, $BindIp) -ForegroundColor Yellow
 Write-Host ("  {0} Physical DNS:- {1}  (pinned; TUN DNS is ignored)" -f $chBullet, $DnsCsv) -ForegroundColor Yellow
 Write-Host ("  {0} port:- {1}" -f $chBullet, $Port) -ForegroundColor Yellow
 Write-Host ("  {0} User:- {1}" -f $chBullet, $userName) -ForegroundColor Yellow
@@ -895,12 +1326,11 @@ if ($UdpGwPort -gt 0) { Write-Host ("  {0} UDPGW Port:- {1}" -f $chBullet, $UdpG
 Write-Host '  ========== Http Custom ==========' -ForegroundColor Green
 Write-Host ("  {0}:{1}@{2}:{3} {4} {5}" -f $ip, $Port, $userName, $Pass, $chArrow, $flag) -ForegroundColor Yellow
 Write-Host '  ------------------------------------------------------------------'
-Write-Host '  # DEV:- l_s_I_I.T.ME' -ForegroundColor DarkGray
 Write-Host ("  # Script V ==> {0} {1}" -f $WinVer, $chCheck) -ForegroundColor Green
 Write-Host '  ------------------------------------------------------------------'
 Write-Host '  Client settings:  SSH + TLS / SNI  (self-signed OK)'
-Write-Host ("  NetMod Host/IP : {0}  (physical NIC - NOT 127.0.0.1, NOT the TUN address)" -f $BindIp) -ForegroundColor Cyan
-Write-Host '  NetMod mode    : TUN/VPN fine - sshd children, UDP and DNS are pinned + route guard active' -ForegroundColor Cyan
+Write-Host ("  NetMod Host/IP : {0}  {1}" -f $ListenerIp, $(if ($ListenerIp -eq '127.0.0.1') { '(local-only - same PC)' } else { '(physical NIC - NOT the TUN address)' })) -ForegroundColor Cyan
+Write-Host ("  NetMod mode    : {0}" -f $(if ($UseInject) { 'TUN/VPN: sshd injection ON, UDP/DNS pinned, route guard active' } else { 'non-TUN recommended: sshd injection OFF; TUN on this host can loop TCP' })) -ForegroundColor Cyan
 Write-Host '  Files          :  ' -NoNewline; Write-Host $RootDir
 Write-Host '  Log            :  ' -NoNewline; Write-Host $LogFile
 Write-Host '  Stop           :  ' -NoNewline; Write-Host ("powershell -File `"{0}`"" -f (Join-Path $RootDir 'Stop-Tunnel.ps1'))
