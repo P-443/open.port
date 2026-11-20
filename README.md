@@ -100,35 +100,39 @@ When you enable **TUN Mode** in NetMod:
 You can force a specific card with `-BindIp 192.168.1.25`. The value is stored in
 `C:\ProgramData\ssh443\primary-ip.txt` so the SYSTEM scheduled task uses it at boot.
 
-#### Option 0b (v1.8+): sshd NIC shim - fixes the "Connected but no internet" loop automatically
+#### Option 0b (v1.9+): sshd NIC shim + route guard + persisted DNS - fully deterministic
 
-> **v1.8:** Binding the listener and the UDP sockets is still not enough. OpenSSH spawns a
-> **fresh `sshd.exe` child for every connection**, and *those children* open the sockets for
-> SOCKS / direct-tcpip forwarding. Windows routes them by destination, so a TUN default
-> route (`0.0.0.0/1` + `128.0.0.0/1` via the TAP adapter) sends them straight back into the
-> tunnel — a recursive loop that kills your internet.
+> **Why v1.8 was still not enough:** it injected the sshd child *after* `CreateProcess`
+> returned, so an extremely fast SOCKS request could win the race. It also re-read DNS
+> from the *live* adapter at startup — when NetMod/TUN is already connected that returns
+> `10.4.2.2` and UDP/DNS goes straight back into the tunnel. Finally, a `/32` route added
+> once at install time can be swamped if NetMod rewrites routes again on reconnect.
 >
-> `Run.ps1` now downloads `native/bindnic.dll` + `native/inject.exe` from the `neteg` branch
-> and writes `native/bindnic.cfg` (line 1 = physical NIC IP, line 2 = interface index).
-> `bindnic.dll` patches `socket` / `connect` / `WSAConnect` / `sendto` / `WSASendTo` /
-> `ConnectEx` in every `sshd.exe` process so each new outbound socket is pinned to the
-> physical NIC with `IP_UNICAST_IF` and a source-IP bind.
->
-> **New in v1.8:** the shim also hooks `CreateProcessW/A` in the sshd parent. When OpenSSH
-> forks a new unprivileged child, that child is injected **inside the CreateProcess hook** —
-> milliseconds after creation, before the parent sends the next protocol byte and long
-> before the first forward request. The old 0.75 s keeper poll is kept only as a safety net.
+> **v1.9 fixes all three:**
+> 1. `bindnic.dll` v3 hooks `CreateProcessW/A` in the sshd parent and starts each child with
+>    `CREATE_SUSPENDED`. It injects the shim **while the child is suspended**, then resumes
+>    it — the child cannot open a single socket before its Winsock IAT is patched. A
+>    maintenance thread also catches modules loaded later.
+> 2. `Run.ps1` persists the physical NIC IP, ifIndex, gateway and resolver(s) into
+>    `C:\ProgramData\ssh443\primary-ip.txt`. `Tunnel443.ps1` uses those values, not the
+>    current TUN adapter, for the UDP gateway's DNS override.
+> 3. `Tunnel443.ps1` runs a route guard every 10 seconds. It re-asserts `/32` routes for the
+>    NIC IP, gateway and DNS resolver(s) with metric 1. These beat NetMod's `/1` routes and
+>    are recorded in `samehost-routes.txt` so `Stop-Tunnel.ps1` can remove exactly what it
+>    created (idempotent and reversible).
 >
 > The **original one-line installer is unchanged** — `Run.ps1` fetches the native files
-> itself. Verify in `C:\ProgramData\ssh443\tunnel.log`:
+> itself from `refs/heads/neteg/native`. Verify:
 > ```
-> sshd binder : watching sshd.exe -> C:\ProgramData\open.port\native\bindnic.dll
-> sshd binder : v2 active - children injected at CreateProcess; details in C:\ProgramData\open.port\native\bindnic.log
-> sshd binder : injected pid 12345
+> sshd binder : v3 active - children injected while suspended at CreateProcess
+> bindnic.log: CreateProcessA child=12345 suspended=1
+> bindnic.log: inject pid=12345 suspended=1 ok=1
+> bindnic.log: resume child=12345 r=1 injected=1
+> bindnic.log: connect  peer=142.251.154.4:443 local=192.168.1.2:53144 if=7 r=0 err=0
+> tunnel.log : route guard : added 192.168.1.1/32 via 0.0.0.0 if=7
+> tunnel.log : udpgw dns   : 192.168.1.1:53 (persisted physical NIC resolver - not TUN DNS)
 > ```
-> `bindnic.log` records every hook and every forced bind, e.g.
-> `hooked connect in WS2_32.dll`, `bind socket=224 r=0 err=0`, `CreateProcessW child=12345`.
-> If the DLL is missing, the tunnel still runs but the log says
+> If the DLL is missing, the log says
 > `sshd binder : DLL not found ... - TUN loop protection OFF`.
 
 #### Option 1: Use "System Proxy" Mode in NetMod (Instant)
@@ -192,6 +196,32 @@ powershell -File .\Stop-Tunnel.ps1 -Uninstall -RemoveUser -User telegram
 - `C:\ProgramData\ssh443\tunnel.log` — Tunnel activity (connections, TLS handshakes, errors).
 - `C:\ProgramData\ssh\logs\sshd.log` — OpenSSH server debug log (`SyslogFacility LOCAL0`).
 - `C:\ProgramData\ssh443\setup-*.log` — Detailed installation log.
+
+---
+
+## 6b. Deterministic same-host verification (TUN connected)
+
+Run these **while NetMod is connected in TUN mode**:
+
+```powershell
+# 1. Routes: our /32 exceptions must exist with metric 1 on the physical NIC.
+route print -4 | findstr /R "192.168.1.2 192.168.1.1 0.0.0.0/1 128.0.0.0/1"
+
+# 2. Shim really loaded into sshd and every forwarded socket shows the physical source IP.
+Get-Content 'C:\ProgramData\open.port\native\bindnic.log' -Tail 60
+
+# 3. Tunnel log: binder v3, persisted DNS, route guard and UDPGW probe.
+Get-Content 'C:\ProgramData\ssh443\tunnel.log' -Tail 80 |
+  Select-String 'sshd binder|route guard|udpgw dns|udpgw keepalive|udpgw first|bind ip|udp nic'
+
+# 4. TCP + DNS while the TUN is up (run from a normal shell, not through the tunnel).
+Resolve-DnsName www.google.com -Server 192.168.1.1 -Type A
+Test-NetConnection 142.250.196.78 -Port 443 -InformationLevel Detailed
+```
+
+Expected: `local=192.168.1.2` in `bindnic.log` (not `10.4.2.1`), no `bind ... err=10022`
+storm, `if=7`, route lines for the NIC/gateway/DNS with metric `1`, and DNS/TCP succeed.
+`Stop-Tunnel.ps1` removes those routes and restarts sshd so the shim is unloaded.
 
 ---
 
