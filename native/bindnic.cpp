@@ -49,7 +49,12 @@ static void Dbg(const char *fmt, ...)
     else return;
 
     FILE *f = NULL;
-    if (fopen_s(&f, log, "a") != 0 || !f) return;
+    if (fopen_s(&f, log, "a") != 0 || !f) {
+        // A non-admin sshd child cannot write into ProgramData. Fall back to a
+        // world-writable location so diagnostics are never silently lost.
+        strcpy_s(log, MAX_PATH, "C:\\Windows\\Temp\\bindnic.log");
+        if (fopen_s(&f, log, "a") != 0 || !f) return;
+    }
     char line[512];
     va_list ap;
     va_start(ap, fmt);
