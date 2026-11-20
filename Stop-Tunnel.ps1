@@ -18,10 +18,102 @@ param(
 )
 
 $ErrorActionPreference = 'Continue'
-$TaskName = 'SSH443-Tunnel'
-$WorkDir  = Join-Path $env:ProgramData 'ssh443'
+$TaskName   = 'SSH443-Tunnel'
+$WorkDir    = Join-Path $env:ProgramData 'ssh443'
+$nicFile    = Join-Path $WorkDir 'primary-ip.txt'
+$RouteState = Join-Path $WorkDir 'samehost-routes.txt'
 
-function Say  ($m, $c = 'Cyan') { Write-Host "  [*] $m" -ForegroundColor $c }
+function Say ($m, $c = 'Cyan') { Write-Host "  [*] $m" -ForegroundColor $c }
+
+function Remove-OneRoute {
+    param([string]$Prefix, [int]$IfIndex, [string]$Hop)
+    $wantHop = if ($Hop) { $Hop } else { '0.0.0.0' }
+    $removed = 0
+    foreach ($store in @('ActiveStore', 'PersistentStore')) {
+        try {
+            $routes = @(Get-NetRoute -DestinationPrefix $Prefix -PolicyStore $store -ErrorAction SilentlyContinue)
+        } catch { continue }
+        foreach ($r in $routes) {
+            $rHop = if ($r.NextHop) { [string]$r.NextHop } else { '0.0.0.0' }
+            if ($IfIndex -gt 0 -and [int]$r.InterfaceIndex -ne $IfIndex) { continue }
+            if ($rHop -ne $wantHop) { continue }
+            try {
+                Remove-NetRoute -InputObject $r -Confirm:$false -ErrorAction SilentlyContinue
+                $removed++
+            } catch { }
+        }
+    }
+    return $removed
+}
+
+function Remove-OurRoutes {
+    $specs = New-Object System.Collections.Generic.List[object]
+
+    # v1.9 state file: one "prefix|ifIndex|nextHop" per line. Only routes that
+    # THIS script added are recorded, so a pre-existing user route is untouched.
+    if (Test-Path $RouteState) {
+        foreach ($line in @(Get-Content -LiteralPath $RouteState -ErrorAction SilentlyContinue)) {
+            if ($line -match '^\s*(\S+/32)\|(\d+)\|(\S+)\s*$') {
+                $specs.Add([pscustomobject]@{ Prefix = $Matches[1]; If = [int]$Matches[2]; Hop = $Matches[3] })
+            }
+        }
+    }
+
+    # Backwards compatibility: older installs only wrote the IP (and later the
+    # gateway/DNS) into primary-ip.txt.
+    if (Test-Path $nicFile) {
+        $lines = @(Get-Content -LiteralPath $nicFile -ErrorAction SilentlyContinue | ForEach-Object { $_.Trim() })
+        $ifIndex = 0
+        if ($lines.Count -gt 1) { $n = 0; if ([int]::TryParse($lines[1], [ref]$n)) { $ifIndex = $n } }
+        if ($lines.Count -gt 0 -and $lines[0] -match '^\d+\.\d+\.\d+\.\d+$') {
+            $specs.Add([pscustomobject]@{ Prefix = "$($lines[0])/32"; If = $ifIndex; Hop = '' })
+        }
+        $gw = if ($lines.Count -gt 2) { $lines[2] } else { '' }
+        if ($gw -match '^\d+\.\d+\.\d+\.\d+$') {
+            $specs.Add([pscustomobject]@{ Prefix = "$gw/32"; If = $ifIndex; Hop = '' })
+            if ($lines.Count -gt 3 -and $lines[3]) {
+                foreach ($d in $lines[3].Split(',')) {
+                    $d = $d.Trim()
+                    if ($d -match '^\d+\.\d+\.\d+\.\d+$' -and $d -ne $gw) {
+                        $specs.Add([pscustomobject]@{ Prefix = "$d/32"; If = $ifIndex; Hop = $gw })
+                    }
+                }
+            }
+        }
+    }
+
+    $total = 0
+    foreach ($s in $specs) { $total += (Remove-OneRoute $s.Prefix $s.If $s.Hop) }
+    if ($total -gt 0) { Say "removed $total same-host /32 route(s)" 'Green' }
+    else { Say 'no same-host routes to remove' 'Yellow' }
+}
+
+function Stop-PortHolders {
+    foreach ($p in @($Port, $UdpGwPort)) {
+        if ($p -le 0) { continue }
+        $pids = New-Object System.Collections.Generic.HashSet[int]
+
+        try {
+            foreach ($c in @(Get-NetTCPConnection -LocalPort $p -State Listen -ErrorAction SilentlyContinue)) {
+                [void]$pids.Add([int]$c.OwningProcess)
+            }
+        } catch { }
+        try {
+            # UDPGW is UDP - the old script only looked at TCP listeners.
+            foreach ($u in @(Get-NetUDPEndpoint -LocalPort $p -ErrorAction SilentlyContinue)) {
+                [void]$pids.Add([int]$u.OwningProcess)
+            }
+        } catch { }
+
+        foreach ($id in $pids) {
+            $proc = Get-Process -Id $id -ErrorAction SilentlyContinue
+            if ($proc -and $proc.ProcessName -match 'powershell|pwsh') {
+                Say "stopping $($proc.ProcessName) ($id) holding port $p"
+                Stop-Process -Id $id -Force -ErrorAction SilentlyContinue
+            }
+        }
+    }
+}
 
 Say 'Stopping scheduled task ...'
 if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
@@ -29,40 +121,27 @@ if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
     Say 'task stopped' 'Green'
 } else { Say 'task not found' 'Yellow' }
 
-# kill whatever still holds the tunnel port / udpgw port
-foreach ($p in @($Port, $UdpGwPort)) {
-    if ($p -le 0) { continue }
-    $conns = Get-NetTCPConnection -LocalPort $p -State Listen -ErrorAction SilentlyContinue
-    foreach ($c in $conns) {
-        $proc = Get-Process -Id $c.OwningProcess -ErrorAction SilentlyContinue
-        if ($proc -and $proc.ProcessName -match 'powershell|pwsh') {
-            Say "stopping $($proc.ProcessName) ($($proc.Id)) holding port $p"
-            Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
-        }
-    }
+Stop-PortHolders
+Remove-OurRoutes
+
+# Restart sshd so any already-injected sshd.exe processes unload bindnic.dll.
+if (Get-Service sshd -ErrorAction SilentlyContinue) {
+    Say 'Restarting sshd to unload the NIC shim ...'
+    Restart-Service sshd -Force -ErrorAction SilentlyContinue
 }
 
-if (-not $Uninstall) { Say 'Done (tunnel stopped).' 'Green'; exit 0 }
+if (-not $Uninstall) { Say 'Done (tunnel stopped, routes and shim processes cleaned).' 'Green'; exit 0 }
 
 Say 'Removing scheduled task ...'
 Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
 
-# remove the pinned primary-NIC route and the saved IP used by Tunnel443.ps1
-$nicFile = Join-Path $WorkDir 'primary-ip.txt'
-if (Test-Path $nicFile) {
-    $bindIp = (Get-Content -LiteralPath $nicFile -TotalCount 1).Trim()
-    if ($bindIp -and $bindIp -ne '0.0.0.0') {
-        foreach ($store in 'PersistentStore', 'ActiveStore') {
-            Get-NetRoute -DestinationPrefix "$bindIp/32" -PolicyStore $store -ErrorAction SilentlyContinue |
-                Remove-NetRoute -PolicyStore $store -Confirm:$false -ErrorAction SilentlyContinue
-        }
-        Say "removed pinned route for $bindIp" 'Green'
-    }
-    Remove-Item $nicFile -Force -ErrorAction SilentlyContinue
-}
+# remove the persisted NIC state used by Tunnel443.ps1 and the route guard
+Remove-Item $nicFile -Force -ErrorAction SilentlyContinue
+Remove-Item $RouteState -Force -ErrorAction SilentlyContinue
+Say 'removed persisted primary-NIC / route state' 'Green'
 
 # remove the native sshd NIC shim. Processes already injected keep the DLL
-# mapped until they exit; the sshd restart below drops those copies.
+# mapped until they exit; the sshd restart above drops those copies.
 $nativeDir = Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Path) 'native'
 if (Test-Path $nativeDir) {
     foreach ($f in 'bindnic.dll','inject.exe','bindnic.cfg','bindnic.log') {
@@ -70,6 +149,7 @@ if (Test-Path $nativeDir) {
     }
     Say 'removed sshd NIC shim files' 'Green'
 }
+Remove-Item (Join-Path $env:WINDIR 'Temp\bindnic.log') -Force -ErrorAction SilentlyContinue
 
 Say 'Removing firewall rules ...'
 Get-NetFirewallRule -DisplayName 'SSH443-Tunnel-*' -ErrorAction SilentlyContinue | Remove-NetFirewallRule -ErrorAction SilentlyContinue
