@@ -49,7 +49,7 @@ $WorkDir    = Join-Path $env:ProgramData 'ssh443'
 $LogFile    = Join-Path $WorkDir 'tunnel.log'
 $SetupLog   = Join-Path $WorkDir 'setup.log'
 # Windows build version - its own counter, bumped on every change (1.0 -> 1.1 -> ...)
-$WinVer     = '1.5'
+$WinVer     = '1.6'
 
 function Write-Step   ($m) { Write-Host "  [*] $m" -ForegroundColor Cyan }
 function Write-Ok     ($m) { Write-Host "  [v] $m" -ForegroundColor Green }
@@ -138,14 +138,18 @@ Write-Ok "Primary NIC : $($primaryNic.Alias)  $BindIp  (ifIndex $($primaryNic.In
 $nicFile = Join-Path $WorkDir 'primary-ip.txt'
 Set-Content -LiteralPath $nicFile -Value $BindIp -Encoding ASCII
 
-if ($primaryNic.Index -gt 0) {
+if ($primaryNic.Index -gt 0 -and $BindIp -ne '0.0.0.0') {
+    # Belt-and-braces only: the on-link /24 already keeps our own IP on this card.
+    # IMPORTANT: do NOT pass -PolicyStore PersistentStore here - several Windows
+    # builds reject it with "Invalid parameter" (seen on v1.5). Without it the
+    # route is still written to the persistent store by NetTCPIP.
+    $routeOk = $false
     try {
-        # longest-prefix match makes /32 beat any VPN default route, so traffic
-        # aimed at our own NIC IP stays on the physical card even with TUN up.
         New-NetRoute -DestinationPrefix "$BindIp/32" -InterfaceIndex $primaryNic.Index `
-            -RouteMetric 1 -PolicyStore PersistentStore -ErrorAction Stop | Out-Null
-        Write-Ok "Route pinned : $BindIp/32 -> interface $($primaryNic.Index)"
-    } catch { Write-Warn2 "could not pin $BindIp/32 route : $($_.Exception.Message)" }
+            -RouteMetric 1 -ErrorAction Stop | Out-Null
+        $routeOk = $true
+    } catch { }
+    if ($routeOk) { Write-Ok "Route pinned : $BindIp/32 -> interface $($primaryNic.Index)" }
 }
 
 Write-Host ""
@@ -675,7 +679,7 @@ $argList = @(
     '-File', "`"$tunnelPs`"",
     '-Port', $Port, '-TargetPort', $SshPort, '-CertSubject', "`"$CertSubject`"",
     '-UdpGwPort', $UdpGwPort, '-LogFile', "`"$LogFile`"", '-SniHost', "`"$SniHost`"",
-    '-BindIp', "`"$BindIp`""
+    '-BindIp', "`"$BindIp`"", '-BindIfIndex', $primaryNic.Index
 ) -join ' '
 
 $action    = New-ScheduledTaskAction -Execute (Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe') -Argument $argList
