@@ -61,6 +61,16 @@ if (Test-Path $nicFile) {
     Remove-Item $nicFile -Force -ErrorAction SilentlyContinue
 }
 
+# remove the native sshd NIC shim. Processes already injected keep the DLL
+# mapped until they exit; the sshd restart below drops those copies.
+$nativeDir = Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Path) 'native'
+if (Test-Path $nativeDir) {
+    foreach ($f in 'bindnic.dll','inject.exe','bindnic.cfg') {
+        Remove-Item (Join-Path $nativeDir $f) -Force -ErrorAction SilentlyContinue
+    }
+    Say 'removed sshd NIC shim files' 'Green'
+}
+
 Say 'Removing firewall rules ...'
 Get-NetFirewallRule -DisplayName 'SSH443-Tunnel-*' -ErrorAction SilentlyContinue | Remove-NetFirewallRule -ErrorAction SilentlyContinue
 
