@@ -1,4 +1,4 @@
-﻿#requires -Version 5.1
+#requires -Version 5.1
 <#
     Run.ps1  -  Windows port of "Run.sh"  (SSH over port 443, no Docker, no extra programs)
     ==============================================================================
@@ -40,7 +40,7 @@ $WorkDir    = Join-Path $env:ProgramData 'ssh443'
 $LogFile    = Join-Path $WorkDir 'tunnel.log'
 $SetupLog   = Join-Path $WorkDir 'setup.log'
 # Windows build version - its own counter, bumped on every change (1.0 -> 1.1 -> ...)
-$WinVer     = '1.3'
+$WinVer     = '1.4'
 
 function Write-Step   ($m) { Write-Host "  [*] $m" -ForegroundColor Cyan }
 function Write-Ok     ($m) { Write-Host "  [v] $m" -ForegroundColor Green }
@@ -337,14 +337,18 @@ function Remove-SshdOption {
     Set-Content -LiteralPath $Config -Value $kept -Encoding ASCII
 }
 
-Set-SshdOption -Config $sshdConfig -Name 'Port'                  -Value $SshPort
-Set-SshdOption -Config $sshdConfig -Name 'PasswordAuthentication' -Value 'yes'
-Set-SshdOption -Config $sshdConfig -Name 'PubkeyAuthentication'   -Value 'yes'
-Set-SshdOption -Config $sshdConfig -Name 'PermitEmptyPasswords'   -Value 'no'
-Set-SshdOption -Config $sshdConfig -Name 'AllowTcpForwarding'     -Value 'yes'
-Set-SshdOption -Config $sshdConfig -Name 'GatewayPorts'           -Value 'yes'
-Set-SshdOption -Config $sshdConfig -Name 'ClientAliveInterval'    -Value '30'
-Set-SshdOption -Config $sshdConfig -Name 'ClientAliveCountMax'    -Value '6'
+Set-SshdOption -Config $sshdConfig -Name 'Port'                       -Value $SshPort
+Set-SshdOption -Config $sshdConfig -Name 'PasswordAuthentication'     -Value 'yes'
+Set-SshdOption -Config $sshdConfig -Name 'PubkeyAuthentication'       -Value 'yes'
+Set-SshdOption -Config $sshdConfig -Name 'PermitEmptyPasswords'       -Value 'no'
+Set-SshdOption -Config $sshdConfig -Name 'AllowTcpForwarding'         -Value 'yes'
+Set-SshdOption -Config $sshdConfig -Name 'GatewayPorts'               -Value 'yes'
+Set-SshdOption -Config $sshdConfig -Name 'PermitTunnel'               -Value 'yes'
+Set-SshdOption -Config $sshdConfig -Name 'AllowStreamLocalForwarding' -Value 'yes'
+Set-SshdOption -Config $sshdConfig -Name 'DisableForwarding'          -Value 'no'
+Set-SshdOption -Config $sshdConfig -Name 'TCPKeepAlive'               -Value 'yes'
+Set-SshdOption -Config $sshdConfig -Name 'ClientAliveInterval'        -Value '30'
+Set-SshdOption -Config $sshdConfig -Name 'ClientAliveCountMax'        -Value '6'
 # readable sshd log next to the tunnel log (default would go to the event log only)
 Set-SshdOption -Config $sshdConfig -Name 'SyslogFacility'         -Value 'LOCAL0'
 # channel level logging: shows which host/port every client forward asked for
@@ -521,7 +525,11 @@ try {
     } else {
         Set-NetFirewallRule -DisplayName 'OpenSSH-Server-In-TCP' -Enabled True -Profile Any -ErrorAction Stop | Out-Null
     }
-    Write-Ok "Firewall : TCP $Port open  (+ SSH $SshPort)"
+    if (-not (Get-NetFirewallRule -DisplayName 'OpenSSH-Server-Out' -ErrorAction SilentlyContinue)) {
+        New-NetFirewallRule -DisplayName 'OpenSSH-Server-Out' -Direction Outbound -Action Allow `
+            -Program "$sshdExe" -Profile Any -ErrorAction SilentlyContinue | Out-Null
+    }
+    Write-Ok "Firewall : TCP $Port open  (+ SSH $SshPort in/out)"
 } catch { Write-Warn2 "Firewall rule not created - $($_.Exception.Message)" }
 
 # ------------------------------------------------------------------ 5. certificate
@@ -668,6 +676,7 @@ Write-Host '  # DEV:- l_s_I_I.T.ME' -ForegroundColor DarkGray
 Write-Host ("  # Script V ==> {0} {1}" -f $WinVer, $chCheck) -ForegroundColor Green
 Write-Host '  ------------------------------------------------------------------'
 Write-Host '  Client settings:  SSH + TLS / SNI  (self-signed OK)'
+Write-Host '  Localhost / NetMod tip: Use "System Proxy" mode on same PC to avoid TUN loop' -ForegroundColor Cyan
 Write-Host '  Files          :  ' -NoNewline; Write-Host $RootDir
 Write-Host '  Log            :  ' -NoNewline; Write-Host $LogFile
 Write-Host '  Stop           :  ' -NoNewline; Write-Host ("powershell -File `"{0}`"" -f (Join-Path $RootDir 'Stop-Tunnel.ps1'))
