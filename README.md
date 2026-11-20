@@ -100,9 +100,9 @@ When you enable **TUN Mode** in NetMod:
 You can force a specific card with `-BindIp 192.168.1.25`. The value is stored in
 `C:\ProgramData\ssh443\primary-ip.txt` so the SYSTEM scheduled task uses it at boot.
 
-#### Option 0b (v1.7+): sshd NIC shim - fixes the "Connected but no internet" loop automatically
+#### Option 0b (v1.8+): sshd NIC shim - fixes the "Connected but no internet" loop automatically
 
-> **v1.7:** Binding the listener and the UDP sockets is still not enough. OpenSSH spawns a
+> **v1.8:** Binding the listener and the UDP sockets is still not enough. OpenSSH spawns a
 > **fresh `sshd.exe` child for every connection**, and *those children* open the sockets for
 > SOCKS / direct-tcpip forwarding. Windows routes them by destination, so a TUN default
 > route (`0.0.0.0/1` + `128.0.0.0/1` via the TAP adapter) sends them straight back into the
@@ -110,19 +110,24 @@ You can force a specific card with `-BindIp 192.168.1.25`. The value is stored i
 >
 > `Run.ps1` now downloads `native/bindnic.dll` + `native/inject.exe` from the `neteg` branch
 > and writes `native/bindnic.cfg` (line 1 = physical NIC IP, line 2 = interface index).
-> `bindnic.dll` patches `connect` / `WSAConnect` in every `sshd.exe` process so each new
-> outbound socket is pinned to the physical NIC with `IP_UNICAST_IF` and a source-IP bind.
-> Because OpenSSH forks a new child per connection, `Tunnel443.ps1` runs a background
-> keeper (as SYSTEM) that re-injects the shim into any new `sshd.exe` within ~0.75 s,
-> and the tunnel also injects immediately the moment a new connection is accepted
-> (that is exactly when OpenSSH spawns the child).
+> `bindnic.dll` patches `socket` / `connect` / `WSAConnect` / `sendto` / `WSASendTo` /
+> `ConnectEx` in every `sshd.exe` process so each new outbound socket is pinned to the
+> physical NIC with `IP_UNICAST_IF` and a source-IP bind.
+>
+> **New in v1.8:** the shim also hooks `CreateProcessW/A` in the sshd parent. When OpenSSH
+> forks a new unprivileged child, that child is injected **inside the CreateProcess hook** —
+> milliseconds after creation, before the parent sends the next protocol byte and long
+> before the first forward request. The old 0.75 s keeper poll is kept only as a safety net.
 >
 > The **original one-line installer is unchanged** — `Run.ps1` fetches the native files
 > itself. Verify in `C:\ProgramData\ssh443\tunnel.log`:
 > ```
 > sshd binder : watching sshd.exe -> C:\ProgramData\open.port\native\bindnic.dll
+> sshd binder : v2 active - children injected at CreateProcess; details in C:\ProgramData\open.port\native\bindnic.log
 > sshd binder : injected pid 12345
 > ```
+> `bindnic.log` records every hook and every forced bind, e.g.
+> `hooked connect in WS2_32.dll`, `bind socket=224 r=0 err=0`, `CreateProcessW child=12345`.
 > If the DLL is missing, the tunnel still runs but the log says
 > `sshd binder : DLL not found ... - TUN loop protection OFF`.
 
