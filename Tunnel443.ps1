@@ -40,6 +40,8 @@ param(
     [string] $RouteStateFile  = '',
     [int]    $RouteGuardInterval = 10,
     [string] $BindNicDll      = '',
+    [string] $ListenerIp      = '',
+    [switch] $UseInject,
     [switch] $NoSshdBind,
     [switch] $UdpGwVerbose,
     [switch] $NoAutoDetect
@@ -897,6 +899,10 @@ if (-not [string]::IsNullOrWhiteSpace($DnsServers)) {
 }
 if ([string]::IsNullOrWhiteSpace($RouteStateFile)) { $RouteStateFile = Join-Path $logDir 'samehost-routes.txt' }
 [Ssh443.Log]::Write("bind ip     : $BindIp  (physical NIC only - TUN/VPN adapter excluded)")
+if ([string]::IsNullOrWhiteSpace($ListenerIp)) { $ListenerIp = $BindIp }
+if ($ListenerIp -ne $BindIp) {
+    [Ssh443.Log]::Write("listener    : $ListenerIp`:$Port (local-only - TUN path removed for the client)")
+}
 
 # Resolve the interface index used by IP_UNICAST_IF. A bound source IP alone can
 # still be routed into a TUN default route; pinning the NIC by index cannot.
@@ -978,7 +984,7 @@ Assert-SameHostRoutes
 # the outbound sockets for SOCKS/direct-tcpip and would otherwise follow the
 # TUN default route straight back into this tunnel (infinite loop / no net).
 # A background keeper pins each new sshd process to the physical NIC.
-if (-not $NoSshdBind) {
+if ($UseInject -and -not $NoSshdBind) {
     if ([string]::IsNullOrWhiteSpace($BindNicDll)) {
         $BindNicDll = Join-Path $PSScriptRoot 'native\bindnic.dll'
     }
@@ -992,12 +998,21 @@ if (-not $NoSshdBind) {
         }
     } catch { }
     [Ssh443.BindNic]::StartKeeper($BindNicDll)
+    # Report the real path from bindnic.cfg line 3 (the DLL reads the same value).
+    $bindLog = ''
+    try {
+        $cfgPath = Join-Path ([System.IO.Path]::GetDirectoryName($BindNicDll)) 'bindnic.cfg'
+        $cfgLines = @(Get-Content -LiteralPath $cfgPath -ErrorAction Stop)
+        if ($cfgLines.Count -ge 3) { $bindLog = $cfgLines[2].Trim() }
+    } catch { }
+    if (-not $bindLog) { $bindLog = Join-Path $env:ProgramData 'ssh443\shim-logs\bindnic.log' }
     if ($v3ok) {
-        [Ssh443.Log]::Write("sshd binder : v3 active - children injected while suspended at CreateProcess; details in " +
-                            [System.IO.Path]::Combine([System.IO.Path]::GetDirectoryName($BindNicDll), "bindnic.log"))
+        [Ssh443.Log]::Write("sshd binder : ENABLED (-UseInject), v3 active - children injected while suspended at CreateProcess; details in " + $bindLog)
     } else {
-        [Ssh443.Log]::Write("sshd binder : STALE DLL - suspended-inject NOT active; rerun Run.ps1 until it reports a verified download")
+        [Ssh443.Log]::Write("sshd binder : ENABLED (-UseInject) but DLL is STALE - suspended-inject NOT active; rerun Run.ps1 -UseInject until it reports a verified download")
     }
+} else {
+    [Ssh443.Log]::Write("sshd binder : DISABLED (no -UseInject); outbound sshd TCP may loop when a TUN client runs on this host")
 }
 
 # ================================================================== certificate
@@ -1033,7 +1048,7 @@ if ($UdpGwPort -gt 0) {
 # ================================================================== start
 [Ssh443.Log]::Write("===== tunnel start  (pid $PID) =====")
 try {
-    [Ssh443.Tunnel]::Start($CertThumbprint, $TargetHost, $TargetPort, $Port, $LogFile, (-not $NoAutoDetect), $PeekMs, $BindIp)
+    [Ssh443.Tunnel]::Start($CertThumbprint, $TargetHost, $TargetPort, $Port, $LogFile, (-not $NoAutoDetect), $PeekMs, $ListenerIp)
 } catch {
     [Ssh443.Log]::Write("FATAL       : cannot listen on port $Port -> $($_.Exception.Message)")
     Write-Host ''
@@ -1053,7 +1068,7 @@ try {
 
 Write-Host ''
 Write-Host "  SSH-over-$Port tunnel is running." -ForegroundColor Green
-Write-Host "  TLS/plain  : $BindIp`:$Port  ->  $TargetHost`:$TargetPort"
+Write-Host "  TLS/plain  : $ListenerIp`:$Port  ->  $TargetHost`:$TargetPort"
 if ($UdpGwPort -gt 0) { Write-Host "  UDP gateway: $UdpGwBind`:$UdpGwPort  (dns $UdpGwDns)" }
 Write-Host "  log        : $LogFile"
 Write-Host '  Press Ctrl+C to stop.' -ForegroundColor DarkGray
