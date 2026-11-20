@@ -49,7 +49,7 @@ $WorkDir    = Join-Path $env:ProgramData 'ssh443'
 $LogFile    = Join-Path $WorkDir 'tunnel.log'
 $SetupLog   = Join-Path $WorkDir 'setup.log'
 # Windows build version - its own counter, bumped on every change (1.0 -> 1.1 -> ...)
-$WinVer     = '1.9'
+$WinVer     = '1.9.1'
 
 function Write-Step   ($m) { Write-Host "  [*] $m" -ForegroundColor Cyan }
 function Write-Ok     ($m) { Write-Host "  [v] $m" -ForegroundColor Green }
@@ -136,9 +136,12 @@ function Get-PhysicalDns {
 function Add-SameHostRoute {
     param([string]$Prefix, [int]$IfIndex, [string]$NextHop, [string]$StateFile)
     $wantHop = if ($NextHop) { $NextHop } else { '0.0.0.0' }
+    # Any /32 route on the physical NIC beats NetMod's /1 routes. Windows may
+    # already have created one (on-link metric 256, or via the gateway metric
+    # 0/25). Do not try to add a duplicate just because the metric differs -
+    # that produced a "MSFT_NetRoute already exists" failure every 10 seconds.
     $existing = @(Get-NetRoute -DestinationPrefix $Prefix -InterfaceIndex $IfIndex -ErrorAction SilentlyContinue)
-    $ok = @($existing | Where-Object { $_.NextHop -eq $wantHop -and [int]$_.RouteMetric -le 1 })
-    if ($ok.Count -gt 0) { return $false }
+    if ($existing.Count -gt 0) { return $false }
     try {
         if ($NextHop) {
             New-NetRoute -DestinationPrefix $Prefix -InterfaceIndex $IfIndex `
@@ -217,18 +220,41 @@ try { & icacls.exe $NativeDir /grant '*S-1-5-32-545:(OI)(CI)M' /T 2>&1 | Out-Nul
 $BindNicDll = Join-Path $NativeDir 'bindnic.dll'
 $InjectExe  = Join-Path $NativeDir 'inject.exe'
 $BindNicLog = Join-Path $NativeDir 'bindnic.log'
-# Use the refs/heads path: the short branch URL is served by a CDN that can keep
-# returning an older native binary for a while after a push.
+# Use the refs/heads path first: the short branch URL is a CDN that can keep
+# returning an older binary after a push. VERIFY the bytes contain the v3
+# marker - an unverified cached DLL silently disabled the suspended-inject fix
+# and left no bindnic.log (seen on the first v1.9 run).
 $RawBase    = 'https://raw.githubusercontent.com/P-443/open.port/refs/heads/neteg/native'
-foreach ($n in 'bindnic.dll','inject.exe') {
-    $dst = Join-Path $NativeDir $n
+$AltBase    = 'https://raw.githubusercontent.com/P-443/open.port/neteg/native'
+$V3Marker   = 'hooks installed (v3)'
+function Test-NativeFile {
+    param([string]$Path, [string]$WantMarker)
+    if (-not (Test-Path -LiteralPath $Path)) { return $false }
     try {
-        Invoke-WebRequest -Uri "$RawBase/$n" -OutFile $dst -UseBasicParsing -TimeoutSec 60
-        Write-Ok "Downloaded native/$n"
-    } catch {
-        if (Test-Path $dst) { Write-Warn2 "Could not refresh $n - using cached copy" }
-        else { Write-Warn2 "Could not download $n : $($_.Exception.Message)" }
+        $b = [IO.File]::ReadAllBytes($Path)
+        if (-not $WantMarker) { return $true }
+        return ([Text.Encoding]::ASCII.GetString($b)).Contains($WantMarker)
+    } catch { return $false }
+}
+foreach ($n in 'bindnic.dll','inject.exe') {
+    $dst  = Join-Path $NativeDir $n
+    $want = if ($n -eq 'bindnic.dll') { $V3Marker } else { '' }
+    $got  = $false
+    for ($attempt = 1; $attempt -le 3 -and -not $got; $attempt++) {
+        foreach ($base in @($RawBase, $AltBase)) {
+            $tmp = Join-Path $env:TEMP ("ssh443-native-$n-$attempt")
+            try {
+                Invoke-WebRequest -Uri "$base/$n" -OutFile $tmp -UseBasicParsing -TimeoutSec 45 -ErrorAction Stop
+                if (Test-NativeFile $tmp $want) { Copy-Item $tmp $dst -Force; $got = $true; break }
+            } catch { }
+            finally { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
+        }
+        if (-not $got) { Start-Sleep -Milliseconds 750 }
     }
+    if ($got) { Write-Ok "Downloaded native/$n (verified)" }
+    elseif (Test-NativeFile $dst $want) { Write-Ok "Cached native/$n is v3 (verified)" }
+    elseif (Test-Path $dst) { Write-Warn2 "Cached $n is STALE - suspended-inject fix NOT active; rerun with internet available" }
+    else { Write-Warn2 "Could not download $n - TUN loop protection OFF" }
 }
 if (Test-Path $BindNicDll) {
     $cfg = Join-Path $NativeDir 'bindnic.cfg'
