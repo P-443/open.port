@@ -982,9 +982,22 @@ if (-not $NoSshdBind) {
     if ([string]::IsNullOrWhiteSpace($BindNicDll)) {
         $BindNicDll = Join-Path $PSScriptRoot 'native\bindnic.dll'
     }
+    # Only claim v3 when the DLL bytes really contain the v3 marker. A stale
+    # cached DLL previously produced a misleading "v3 active" log line.
+    $v3ok = $false
+    try {
+        if (Test-Path -LiteralPath $BindNicDll) {
+            $db = [IO.File]::ReadAllBytes($BindNicDll)
+            $v3ok = ([Text.Encoding]::ASCII.GetString($db)).Contains('hooks installed (v3)')
+        }
+    } catch { }
     [Ssh443.BindNic]::StartKeeper($BindNicDll)
-    [Ssh443.Log]::Write("sshd binder : v3 active - children injected while suspended at CreateProcess; details in " +
-                        [System.IO.Path]::Combine([System.IO.Path]::GetDirectoryName($BindNicDll), "bindnic.log"))
+    if ($v3ok) {
+        [Ssh443.Log]::Write("sshd binder : v3 active - children injected while suspended at CreateProcess; details in " +
+                            [System.IO.Path]::Combine([System.IO.Path]::GetDirectoryName($BindNicDll), "bindnic.log"))
+    } else {
+        [Ssh443.Log]::Write("sshd binder : STALE DLL - suspended-inject NOT active; rerun Run.ps1 until it reports a verified download")
+    }
 }
 
 # ================================================================== certificate
