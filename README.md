@@ -121,6 +121,12 @@ You can force a specific card with `-BindIp 192.168.1.25`. The value is stored i
 >    are recorded in `samehost-routes.txt` so `Stop-Tunnel.ps1` can remove exactly what it
 >    created (idempotent and reversible).
 >
+> **v1.9.1 (two live-run fixes):** the route guard now accepts *any* `/32` route on the
+> physical NIC (Windows adds an on-link one with metric 256) instead of demanding an exact
+> hop+metric, so it no longer logs `MSFT_NetRoute already exists` every 10 s; and the native
+> download retries across both raw bases and verifies the DLL really contains the v3 marker
+> before accepting it, so a stale cached DLL can never silently disable suspended-inject.
+>
 > The **original one-line installer is unchanged** — `Run.ps1` fetches the native files
 > itself from `refs/heads/neteg/native`. Verify:
 > ```
@@ -129,7 +135,7 @@ You can force a specific card with `-BindIp 192.168.1.25`. The value is stored i
 > bindnic.log: inject pid=12345 suspended=1 ok=1
 > bindnic.log: resume child=12345 r=1 injected=1
 > bindnic.log: connect  peer=142.251.154.4:443 local=192.168.1.2:53144 if=7 r=0 err=0
-> tunnel.log : route guard : added 192.168.1.1/32 via 0.0.0.0 if=7
+> tunnel.log : route guard : ok 192.168.1.2/32 if=7 via=on-link metric=256
 > tunnel.log : udpgw dns   : 192.168.1.1:53 (persisted physical NIC resolver - not TUN DNS)
 > ```
 > If the DLL is missing, the log says
