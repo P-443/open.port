@@ -6,7 +6,9 @@
         udocker run dweomer/stunnel  (stunnel :443 -> 127.0.0.1:22)
         ./udpgw/server -port 7300    (UDP over the tunnel for games / DNS / calls)
 
-    Part 1 : TLS/plain listener on <Port> forwarding to 127.0.0.1:<TargetPort>
+    Part 1 : TLS/plain listener on <BindIp>:<Port> forwarding to 127.0.0.1:<TargetPort>
+             - BindIp is the detected physical NIC, never the VPN/TUN adapter
+             - outbound UDP sockets are bound to the same IP (no TUN loop)
              - first byte 0x16  -> real TLS handshake (HTTP Custom "TLS + SNI")
              - anything else    -> transparent pass-through (raw ssh on 443)
     Part 2 : UDP gateway on <UdpGwPort> (default 127.0.0.1:7300, reached through
@@ -30,6 +32,7 @@ param(
     [int]    $UdpGwPort       = 7300,
     [string] $UdpGwBind       = '127.0.0.1',
     [string] $UdpGwDns        = '',
+    [string] $BindIp          = '',
     [switch] $UdpGwVerbose,
     [switch] $NoAutoDetect
 )
@@ -96,6 +99,7 @@ namespace Ssh443
         public static X509Certificate2 Cert = null;
         public static bool   AutoDetect = true;
         public static int    PeekMs = 2000;
+        public static string BindIp = "";      // physical NIC only; never the TUN adapter
 
         public static long ConnTotal = 0, ConnTls = 0, ConnPlain = 0, ConnActive = 0, Errs = 0;
         public static long BytesUp = 0, BytesDown = 0;
@@ -155,16 +159,20 @@ namespace Ssh443
         }
 
         public static void Start(string thumb, string targetHost, int targetPort, int port,
-                                 string logFile, bool autoDetect, int peekMs)
+                                 string logFile, bool autoDetect, int peekMs, string bindIp)
         {
             TargetHost = targetHost; TargetPort = targetPort;
             AutoDetect = autoDetect; PeekMs = peekMs;
+            BindIp = (bindIp == null) ? "" : bindIp.Trim();
 
             Cert = LoadCert(thumb);
             Log.Write("cert        : " + Cert.Subject + "  [" + Cert.Thumbprint + "]  until " + Cert.NotAfter.ToString("yyyy-MM-dd"));
 
-            _listener = ListenAny(null, port, 1024);
-            Log.Write("tcp listen  : 0.0.0.0:" + port + " (IPv4+IPv6)  ->  " + targetHost + ":" + targetPort);
+            // bind to the real internet card only (0.0.0.0 means "all adapters",
+            // which includes the VPN TUN -> recursive loop).
+            _listener = ListenAny(BindIp, port, 1024);
+            string shown = BindIp.Length == 0 ? "0.0.0.0" : BindIp;
+            Log.Write("tcp listen  : " + shown + ":" + port + (BindIp.Length == 0 ? " (all adapters)" : " (physical NIC only)") + "  ->  " + targetHost + ":" + targetPort);
             Log.Write("tcp mode    : " + (autoDetect ? "auto (TLS + plain TCP)" : "TLS only"));
 
             Thread t = new Thread(new ThreadStart(AcceptLoop));
@@ -300,6 +308,7 @@ namespace Ssh443
         public static int IdleTimeoutMs = 120000;
         public static string DnsHost = "";
         public static int DnsPort = 53;
+        public static string OutBindIp = "";   // source IP for outbound UDP (physical NIC)
 
         public static long Sessions = 0, ConnTotal = 0, ConnActive = 0, PktsUp = 0, PktsDown = 0, Errs = 0;
 
@@ -554,7 +563,12 @@ namespace Ssh443
                     const int SIO_UDP_CONNRESET = -1744830452; // 0x9800000C
                     u.IOControl(SIO_UDP_CONNRESET, new byte[] { 0 }, new byte[] { 0 });
                 } catch { }
-                u.Bind(new IPEndPoint(sendTo.AddressFamily == AddressFamily.InterNetworkV6 ? IPAddress.IPv6Any : IPAddress.Any, 0));
+                IPAddress src = null;
+                if (!string.IsNullOrEmpty(OutBindIp)) IPAddress.TryParse(OutBindIp, out src);
+                if (src != null && src.AddressFamily == sendTo.AddressFamily)
+                    u.Bind(new IPEndPoint(src, 0));
+                else
+                    u.Bind(new IPEndPoint(sendTo.AddressFamily == AddressFamily.InterNetworkV6 ? IPAddress.IPv6Any : IPAddress.Any, 0));
 
                 Conn con = new Conn();
                 con.Owner = ses; con.ConId = conid; con.Udp = u;
@@ -662,6 +676,15 @@ $logDir = Split-Path -Parent $LogFile
 if ($logDir -and -not (Test-Path $logDir)) { New-Item -ItemType Directory -Force -Path $logDir | Out-Null }
 [Ssh443.Log]::File = $LogFile
 
+# ================================================================== primary NIC
+# Run.ps1 passes -BindIp explicitly; the file is the fallback for the SYSTEM task.
+if ([string]::IsNullOrWhiteSpace($BindIp)) {
+    $nicFile = Join-Path $logDir 'primary-ip.txt'
+    if (Test-Path $nicFile) { $BindIp = (Get-Content -LiteralPath $nicFile -TotalCount 1).Trim() }
+}
+if ([string]::IsNullOrWhiteSpace($BindIp)) { $BindIp = '0.0.0.0' }
+[Ssh443.Log]::Write("bind ip     : $BindIp  (physical NIC only - TUN/VPN adapter excluded)")
+
 # ================================================================== certificate
 if ([string]::IsNullOrWhiteSpace($CertThumbprint)) {
     $found = Get-ChildItem Cert:\LocalMachine\My |
@@ -689,7 +712,7 @@ if ($UdpGwPort -gt 0 -and [string]::IsNullOrWhiteSpace($UdpGwDns)) {
 # ================================================================== start
 [Ssh443.Log]::Write("===== tunnel start  (pid $PID) =====")
 try {
-    [Ssh443.Tunnel]::Start($CertThumbprint, $TargetHost, $TargetPort, $Port, $LogFile, (-not $NoAutoDetect), $PeekMs)
+    [Ssh443.Tunnel]::Start($CertThumbprint, $TargetHost, $TargetPort, $Port, $LogFile, (-not $NoAutoDetect), $PeekMs, $BindIp)
 } catch {
     [Ssh443.Log]::Write("FATAL       : cannot listen on port $Port -> $($_.Exception.Message)")
     Write-Host ''
@@ -699,6 +722,7 @@ try {
     exit 1
 }
 [Ssh443.UdpGw]::Verbose = [bool]$UdpGwVerbose
+[Ssh443.UdpGw]::OutBindIp = $BindIp
 try {
     if ($UdpGwPort -gt 0) { [Ssh443.UdpGw]::Start($UdpGwBind, $UdpGwPort, $UdpGwDns) }
 } catch {
@@ -708,7 +732,7 @@ try {
 
 Write-Host ''
 Write-Host "  SSH-over-$Port tunnel is running." -ForegroundColor Green
-Write-Host "  TLS/plain  : 0.0.0.0:$Port  ->  $TargetHost`:$TargetPort"
+Write-Host "  TLS/plain  : $BindIp`:$Port  ->  $TargetHost`:$TargetPort"
 if ($UdpGwPort -gt 0) { Write-Host "  UDP gateway: $UdpGwBind`:$UdpGwPort  (dns $UdpGwDns)" }
 Write-Host "  log        : $LogFile"
 Write-Host '  Press Ctrl+C to stop.' -ForegroundColor DarkGray
