@@ -49,7 +49,7 @@ $WorkDir    = Join-Path $env:ProgramData 'ssh443'
 $LogFile    = Join-Path $WorkDir 'tunnel.log'
 $SetupLog   = Join-Path $WorkDir 'setup.log'
 # Windows build version - its own counter, bumped on every change (1.0 -> 1.1 -> ...)
-$WinVer     = '1.7'
+$WinVer     = '1.8'
 
 function Write-Step   ($m) { Write-Host "  [*] $m" -ForegroundColor Cyan }
 function Write-Ok     ($m) { Write-Host "  [v] $m" -ForegroundColor Green }
@@ -152,7 +152,7 @@ if ($primaryNic.Index -gt 0 -and $BindIp -ne '0.0.0.0') {
     if ($routeOk) { Write-Ok "Route pinned : $BindIp/32 -> interface $($primaryNic.Index)" }
 }
 
-# ------------------------------------------------------------------ sshd NIC shim (v1.7)
+# ------------------------------------------------------------------ sshd NIC shim (v1.8)
 # OpenSSH forks a NEW sshd.exe for every connection.  Those children open the
 # outbound sockets used by SOCKS / direct-tcpip and would follow the client's
 # TUN default route straight back into this tunnel (recursive loop -> no net).
