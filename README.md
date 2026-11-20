@@ -204,8 +204,10 @@ powershell -File .\Stop-Tunnel.ps1 -Uninstall -RemoveUser -User telegram
 Run these **while NetMod is connected in TUN mode**:
 
 ```powershell
-# 1. Routes: our /32 exceptions must exist with metric 1 on the physical NIC.
-route print -4 | findstr /R "192.168.1.2 192.168.1.1 0.0.0.0/1 128.0.0.0/1"
+# 1. Routes: our /32 exceptions must exist with metric 1 on the physical NIC,
+#    while NetMod's /1 routes still point at the TUN (that is expected and fine).
+route print -4 | findstr "192.168.1.2 192.168.1.1 10.4.2.2 128.0.0.0"
+Get-NetRoute -DestinationPrefix 192.168.1.2/32,192.168.1.1/32 | Select DestinationPrefix,NextHop,InterfaceIndex,RouteMetric
 
 # 2. Shim really loaded into sshd and every forwarded socket shows the physical source IP.
 Get-Content 'C:\ProgramData\open.port\native\bindnic.log' -Tail 60
