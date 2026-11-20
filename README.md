@@ -48,6 +48,8 @@ powershell -ExecutionPolicy Bypass -File .\Run.ps1 -User myuser -Pass 'MySecureP
 | `-SniHost` | `$User` | Domain name to include in the self-signed TLS certificate |
 | `-BindIp` | auto | Physical NIC IP to bind sshd + the 443 listener + UDP sockets to (auto-detected if omitted) |
 | `-BindIfIndex` | auto | NIC index for `IP_UNICAST_IF` so UDP bypasses a TUN default route (passed automatically by `Run.ps1`) |
+| `-BindNicDll` | auto | Path to `native\bindnic.dll`, the shim that pins `sshd.exe`'s outbound sockets to the physical NIC |
+| `-NoSshdBind` | `False` | Switch to disable the sshd NIC shim (not recommended in TUN mode) |
 | `-NoUdpgw` | `False` | Switch to disable the UDP gateway completely |
 
 ---
@@ -98,10 +100,29 @@ When you enable **TUN Mode** in NetMod:
 You can force a specific card with `-BindIp 192.168.1.25`. The value is stored in
 `C:\ProgramData\ssh443\primary-ip.txt` so the SYSTEM scheduled task uses it at boot.
 
-> Note: Windows still chooses the route for *outbound connections opened by `sshd.exe`*
-> by destination, not by process. The listener/bind fix above removes the listener-side
-> loop; if your VPN client still captures `sshd.exe`'s own upstream sockets, add the
-> process bypass below (Option 2) or use System Proxy (Option 1).
+#### Option 0b (v1.7+): sshd NIC shim - fixes the "Connected but no internet" loop automatically
+
+> **v1.7:** Binding the listener and the UDP sockets is still not enough. OpenSSH spawns a
+> **fresh `sshd.exe` child for every connection**, and *those children* open the sockets for
+> SOCKS / direct-tcpip forwarding. Windows routes them by destination, so a TUN default
+> route (`0.0.0.0/1` + `128.0.0.0/1` via the TAP adapter) sends them straight back into the
+> tunnel — a recursive loop that kills your internet.
+>
+> `Run.ps1` now downloads `native/bindnic.dll` + `native/inject.exe` from the `neteg` branch
+> and writes `native/bindnic.cfg` (line 1 = physical NIC IP, line 2 = interface index).
+> `bindnic.dll` patches `connect` / `WSAConnect` in every `sshd.exe` process so each new
+> outbound socket is pinned to the physical NIC with `IP_UNICAST_IF` and a source-IP bind.
+> Because OpenSSH forks a new child per connection, `Tunnel443.ps1` runs a background
+> keeper (as SYSTEM) that re-injects the shim into any new `sshd.exe` within ~0.75 s.
+>
+> The **original one-line installer is unchanged** — `Run.ps1` fetches the native files
+> itself. Verify in `C:\ProgramData\ssh443\tunnel.log`:
+> ```
+> sshd binder : watching sshd.exe -> C:\ProgramData\open.port\native\bindnic.dll
+> sshd binder : injected pid 12345
+> ```
+> If the DLL is missing, the tunnel still runs but the log says
+> `sshd binder : DLL not found ... - TUN loop protection OFF`.
 
 #### Option 1: Use "System Proxy" Mode in NetMod (Instant)
 - Inside NetMod PC, switch the connection mode from **TUN Mode** to **System Proxy Mode**.
