@@ -65,7 +65,7 @@ if (Test-Path $nicFile) {
 # mapped until they exit; the sshd restart below drops those copies.
 $nativeDir = Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Path) 'native'
 if (Test-Path $nativeDir) {
-    foreach ($f in 'bindnic.dll','inject.exe','bindnic.cfg') {
+    foreach ($f in 'bindnic.dll','inject.exe','bindnic.cfg','bindnic.log') {
         Remove-Item (Join-Path $nativeDir $f) -Force -ErrorAction SilentlyContinue
     }
     Say 'removed sshd NIC shim files' 'Green'
