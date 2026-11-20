@@ -49,7 +49,7 @@ $WorkDir    = Join-Path $env:ProgramData 'ssh443'
 $LogFile    = Join-Path $WorkDir 'tunnel.log'
 $SetupLog   = Join-Path $WorkDir 'setup.log'
 # Windows build version - its own counter, bumped on every change (1.0 -> 1.1 -> ...)
-$WinVer     = '1.6'
+$WinVer     = '1.7'
 
 function Write-Step   ($m) { Write-Host "  [*] $m" -ForegroundColor Cyan }
 function Write-Ok     ($m) { Write-Host "  [v] $m" -ForegroundColor Green }
@@ -150,6 +150,43 @@ if ($primaryNic.Index -gt 0 -and $BindIp -ne '0.0.0.0') {
         $routeOk = $true
     } catch { }
     if ($routeOk) { Write-Ok "Route pinned : $BindIp/32 -> interface $($primaryNic.Index)" }
+}
+
+# ------------------------------------------------------------------ sshd NIC shim (v1.7)
+# OpenSSH forks a NEW sshd.exe for every connection.  Those children open the
+# outbound sockets used by SOCKS / direct-tcpip and would follow the client's
+# TUN default route straight back into this tunnel (recursive loop -> no net).
+# bindnic.dll forces every new socket out via the detected physical NIC.
+# Downloaded from neteg here so the ORIGINAL one-line installer (which only
+# fetches the three .ps1 files) continues to work unchanged.
+$NativeDir  = Join-Path $RootDir 'native'
+if (-not (Test-Path $NativeDir)) { New-Item -ItemType Directory -Force -Path $NativeDir | Out-Null }
+$BindNicDll = Join-Path $NativeDir 'bindnic.dll'
+$InjectExe  = Join-Path $NativeDir 'inject.exe'
+$RawBase    = 'https://raw.githubusercontent.com/P-443/open.port/neteg/native'
+foreach ($n in 'bindnic.dll','inject.exe') {
+    $dst = Join-Path $NativeDir $n
+    try {
+        Invoke-WebRequest -Uri "$RawBase/$n" -OutFile $dst -UseBasicParsing -TimeoutSec 60
+        Write-Ok "Downloaded native/$n"
+    } catch {
+        if (Test-Path $dst) { Write-Warn2 "Could not refresh $n - using cached copy" }
+        else { Write-Warn2 "Could not download $n : $($_.Exception.Message)" }
+    }
+}
+if (Test-Path $BindNicDll) {
+    $cfg = Join-Path $NativeDir 'bindnic.cfg'
+    @($BindIp, "$($primaryNic.Index)") | Set-Content -LiteralPath $cfg -Encoding ASCII
+    Write-Ok "sshd binder config : bind=$BindIp if=$($primaryNic.Index)"
+    # Immediate injection into the already running sshd service.  The SYSTEM
+    # tunnel keeper takes care of the per-connection children from then on.
+    if (Test-Path $InjectExe) {
+        Get-Process sshd -ErrorAction SilentlyContinue | ForEach-Object {
+            & $InjectExe $_.Id $BindNicDll 2>&1 | Out-Null
+        }
+    }
+} else {
+    Write-Warn2 'sshd NIC shim unavailable - TUN loop protection OFF'
 }
 
 Write-Host ""
@@ -679,7 +716,8 @@ $argList = @(
     '-File', "`"$tunnelPs`"",
     '-Port', $Port, '-TargetPort', $SshPort, '-CertSubject', "`"$CertSubject`"",
     '-UdpGwPort', $UdpGwPort, '-LogFile', "`"$LogFile`"", '-SniHost', "`"$SniHost`"",
-    '-BindIp', "`"$BindIp`"", '-BindIfIndex', $primaryNic.Index
+    '-BindIp', "`"$BindIp`"", '-BindIfIndex', $primaryNic.Index,
+    '-BindNicDll', "`"$BindNicDll`""
 ) -join ' '
 
 $action    = New-ScheduledTaskAction -Execute (Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe') -Argument $argList
