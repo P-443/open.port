@@ -143,7 +143,7 @@ $WorkDir    = Join-Path $env:ProgramData 'ssh443'
 $LogFile    = Join-Path $WorkDir 'tunnel.log'
 $SetupLog   = Join-Path $WorkDir 'setup.log'
 # Windows build version - its own counter, bumped on every change (1.0 -> 1.1 -> ...)
-$WinVer     = '2.0'
+$WinVer     = '2.2'
 
 function Write-Step   ($m) { Write-Host "  [*] $m" -ForegroundColor Cyan }
 function Write-Ok     ($m) { Write-Host "  [v] $m" -ForegroundColor Green }
@@ -436,10 +436,18 @@ if ($SelfTest) {
 
     # 1. The native helper must be the pinned, verified v3 build.
     $dllPath = Join-Path $env:ProgramData 'open.port\native\bindnic.dll'
-    if (-not (Test-Path -LiteralPath $dllPath)) {
-        ST-Fail "bindnic.dll is MISSING ($dllPath). Re-run Run.ps1 -UseInject with internet access."
+    try {
+        if (-not (Test-Path -LiteralPath $dllPath -ErrorAction Stop)) {
+            ST-Fail "bindnic.dll is MISSING ($dllPath). Re-run Run.ps1 -UseInject with internet access."
+        }
+    } catch {
+        ST-Fail "bindnic.dll cannot be inspected ($dllPath): $($_.Exception.Message). Check Defender quarantine and icacls; no exclusions are added automatically."
     }
-    $dllHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $dllPath).Hash.ToLower()
+    try {
+        $dllHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $dllPath -ErrorAction Stop).Hash.ToLower()
+    } catch {
+        ST-Fail "bindnic.dll cannot be hashed ($dllPath): $($_.Exception.Message)"
+    }
     $wantDll = '482a067b0d1e1fa499abf52bfad19fafeb36bf52f890689779dd747f3ccb2593'
     if ($dllHash -ne $wantDll) {
         ST-Fail "bindnic.dll is STALE: SHA256 $dllHash, expected $wantDll - loop protection is NOT active"
@@ -581,9 +589,21 @@ if (-not (Test-Path $NativeDir)) { New-Item -ItemType Directory -Force -Path $Na
 # native\ holds executable code. Only SYSTEM and Administrators may write here.
 # Users:Modify on this folder would let any local account replace bindnic.dll.
 try {
-    & icacls.exe $NativeDir /inheritance:r /remove:g '*S-1-5-32-545' /T 2>&1 | Out-Null
+    # Grant FIRST, then strip inherited ACEs. Reversing this order can leave a
+    # file with no Administrators ACE at all if the second command fails.
     & icacls.exe $NativeDir /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' /T 2>&1 | Out-Null
+    & icacls.exe $NativeDir /inheritance:r /remove:g '*S-1-5-32-545' /T 2>&1 | Out-Null
 } catch { }
+# Verify the installer can still use its own code directory. A quarantined or
+# deny-ACL'd DLL otherwise surfaces later as a cryptic Test-Path failure.
+$probeFile = Join-Path $NativeDir ('.write-probe-' + [guid]::NewGuid().ToString('N'))
+try {
+    [IO.File]::WriteAllText($probeFile, 'ok')
+    Remove-Item -LiteralPath $probeFile -Force -ErrorAction Stop
+} catch {
+    Write-Err2 "native code directory is not writable: $NativeDir - $($_.Exception.Message)"
+    Write-Warn2 "Inspect it with: icacls `"$NativeDir`"   (do not add antivirus exclusions blindly)"
+}
 $BindNicDll = Join-Path $NativeDir 'bindnic.dll'
 $InjectExe  = Join-Path $NativeDir 'inject.exe'
 
@@ -614,6 +634,39 @@ function Test-V3Marker {
     try { return ([Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes($Path))).Contains($V3Marker) } catch { return $false }
 }
 
+# Report (do not remediate) antivirus quarantine BEFORE touching cached files.
+# A quarantined DLL commonly denies even Administrators access to the file, which
+# otherwise looks like an unexplained Test-Path failure. No exclusions are added.
+try {
+    $threats = @(Get-MpThreatDetection -ErrorAction Stop | Where-Object {
+        $r = ($_.Resources -join ' ')
+        $r -match 'bindnic|inject\.exe|open\.port'
+    })
+    if ($threats.Count -gt 0) {
+        Write-Err2 "Defender quarantine detected for our native helper ($($threats.Count) detection(s))."
+        Write-Warn2 'Add an exclusion manually if you trust this repository; this script never adds exclusions.'
+        $threats | Select-Object -First 5 InitialDetectionTime,ThreatID,Resources | Format-List | Out-String -Width 160 | Write-Host
+    }
+} catch {
+    Write-Warn2 "Defender threat detection unavailable: $($_.Exception.Message)"
+}
+
+# A denied path/hash must be reported, never allowed to terminate the installer.
+function Probe-Path {
+    param([string]$Path)
+    try { return [bool](Test-Path -LiteralPath $Path -ErrorAction Stop) }
+    catch {
+        Write-Err2 "ACCESS DENIED at $Path - $($_.Exception.Message)"
+        Write-Warn2 "Inspect with: icacls `"$Path`"   (Defender quarantine report is printed above)"
+        return $null
+    }
+}
+function Probe-Sha256 {
+    param([string]$Path)
+    try { return (Get-FileHash -Algorithm SHA256 -LiteralPath $Path -ErrorAction Stop).Hash.ToLower() }
+    catch { Write-Err2 "ACCESS DENIED hashing $Path - $($_.Exception.Message)"; return '' }
+}
+
 $NativeHelperOk = $true
 foreach ($n in @('bindnic.dll','inject.exe')) {
     $dst = Join-Path $NativeDir $n
@@ -634,7 +687,7 @@ foreach ($n in @('bindnic.dll','inject.exe')) {
                 $got = $true
             }
         } catch {
-            $failures.Add("attempt $attempt : download from $NativeBase/$n failed - $($_.Exception.Message)")
+            $failures.Add("attempt $attempt : download/install of $n from $NativeBase failed - $($_.Exception.Message)")
         } finally { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
         if (-not $got) { Start-Sleep -Milliseconds 750 }
     }
@@ -642,16 +695,18 @@ foreach ($n in @('bindnic.dll','inject.exe')) {
     # Text fallback for the DLL: downloaded and decoded locally, then held to
     # the SAME pinned SHA256. A mismatch is refused, never silently accepted.
     if ($n -eq 'bindnic.dll' -and -not $got) {
+        $tmpB64 = Join-Path $env:TEMP 'ssh443-bindnic.b64'
+        $tmpDll = Join-Path $env:TEMP 'ssh443-bindnic-decoded.dll'
         try {
-            $c = (Invoke-WebRequest -Uri "$NativeBase/bindnic.b64" -UseBasicParsing -TimeoutSec 90 -ErrorAction Stop).Content
-            if ($c -is [byte[]]) { $c = [Text.Encoding]::ASCII.GetString($c) }
-            $b64Hash = ([Security.Cryptography.SHA256]::Create().ComputeHash([Text.Encoding]::UTF8.GetBytes(($c -replace '\s',''))))
-            $b64Hex  = [BitConverter]::ToString($b64Hash).Replace('-','').ToLower()
+            # The pinned hash is of the RAW downloaded file. Hashing a decoded
+            # string changes line endings/encoding and always mismatches.
+            Invoke-WebRequest -Uri "$NativeBase/bindnic.b64" -OutFile $tmpB64 -UseBasicParsing -TimeoutSec 90 -ErrorAction Stop
+            $b64Hex = Get-Sha256 $tmpB64
             if ($b64Hex -ne $PinnedB64Sha) {
                 $failures.Add("base64 fallback : SHA256 mismatch - expected $PinnedB64Sha, got $b64Hex")
             } else {
-                $bytes = [Convert]::FromBase64String(($c -replace '\s',''))
-                $tmpDll = Join-Path $env:TEMP 'ssh443-bindnic-decoded.dll'
+                $text  = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes($tmpB64))
+                $bytes = [Convert]::FromBase64String(($text -replace '\s',''))
                 [IO.File]::WriteAllBytes($tmpDll, $bytes)
                 $actual = Get-Sha256 $tmpDll
                 if ($actual -ne $expect) {
@@ -662,50 +717,47 @@ foreach ($n in @('bindnic.dll','inject.exe')) {
                     Copy-Item $tmpDll $dst -Force
                     $got = $true
                 }
-                Remove-Item $tmpDll -Force -ErrorAction SilentlyContinue
             }
         } catch { $failures.Add("base64 fallback : $($_.Exception.Message)") }
+        finally {
+            Remove-Item -LiteralPath $tmpB64 -Force -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath $tmpDll -Force -ErrorAction SilentlyContinue
+        }
     }
 
     if ($got) { Write-Ok "Downloaded native/$n (SHA256=$expect)" }
-    elseif (Test-Path $dst) {
-        $cached = Get-Sha256 $dst
-        if ($cached -eq $expect) { Write-Ok "Cached native/$n verified (SHA256=$cached)" }
-        else {
+    else {
+        $exists = Probe-Path $dst
+        if ($null -eq $exists) {
             $NativeHelperOk = $false
-            Write-Err2 "REFUSED: $dst has SHA256 $cached, expected $expect - it will NOT be used"
+            Write-Err2 "REFUSED: $dst cannot be inspected (access denied) - treat it as untrusted"
+        } elseif ($exists) {
+            $cached = Probe-Sha256 $dst
+            if (-not $cached) {
+                $NativeHelperOk = $false
+                Write-Err2 "REFUSED: $dst could not be hashed - treat it as untrusted"
+            } elseif ($cached -eq $expect) { Write-Ok "Cached native/$n verified (SHA256=$cached)" }
+            else {
+                $NativeHelperOk = $false
+                Write-Err2 "REFUSED: $dst has SHA256 $cached, expected $expect - it will NOT be used"
+            }
+        } else {
+            $NativeHelperOk = $false
+            Write-Err2 "REFUSED: $n is missing and no verified copy could be downloaded"
         }
-    } else {
-        $NativeHelperOk = $false
-        Write-Err2 "REFUSED: $n is missing and no verified copy could be downloaded"
     }
     foreach ($f in $failures) { Write-Warn2 "  reason: $f" }
 }
 
-# Report (do not remediate) antivirus quarantine. No exclusions are added.
-try {
-    $threats = @(Get-MpThreatDetection -ErrorAction Stop | Where-Object {
-        $r = ($_.Resources -join ' ')
-        $r -match 'bindnic|inject\.exe|open\.port'
-    })
-    if ($threats.Count -gt 0) {
-        Write-Err2 "Defender quarantine detected for our native helper ($($threats.Count) detection(s))."
-        Write-Warn2 'Add an exclusion manually if you trust this repository; this script never adds exclusions.'
-        $threats | Select-Object -First 5 InitialDetectionTime,ThreatID,Resources | Format-List | Out-String -Width 160 | Write-Host
-    }
-} catch {
-    Write-Warn2 "Defender threat detection unavailable: $($_.Exception.Message)"
-}
-
 if (-not $UseInject) {
     Write-Ok 'sshd injection disabled (default) - pass -UseInject only for a TUN client on this host'
-} elseif (-not ($NativeHelperOk -and (Test-Path $BindNicDll))) {
-    Write-Err2 '-UseInject requested but bindnic.dll is missing or failed hash verification; loop protection is NOT active'
+} elseif (-not ($NativeHelperOk -and ((Probe-Path $BindNicDll) -eq $true))) {
+    Write-Err2 '-UseInject requested but bindnic.dll is missing, denied or failed hash verification; loop protection is NOT active (see the REFUSED/ACCESS DENIED lines above)'
 } else {
     $cfg = Join-Path $NativeDir 'bindnic.cfg'
     @($BindIp, "$($primaryNic.Index)", $BindNicLog) | Set-Content -LiteralPath $cfg -Encoding ASCII
     Write-Ok "sshd binder config : bind=$BindIp if=$($primaryNic.Index) log=$BindNicLog"
-    if (Test-Path $InjectExe) {
+    if ((Probe-Path $InjectExe) -eq $true) {
         Get-Process sshd -ErrorAction SilentlyContinue | ForEach-Object {
             & $InjectExe $_.Id $BindNicDll 2>&1 | Out-Null
         }
