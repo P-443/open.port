@@ -143,7 +143,7 @@ $WorkDir    = Join-Path $env:ProgramData 'ssh443'
 $LogFile    = Join-Path $WorkDir 'tunnel.log'
 $SetupLog   = Join-Path $WorkDir 'setup.log'
 # Windows build version - its own counter, bumped on every change (1.0 -> 1.1 -> ...)
-$WinVer     = '2.2'
+$WinVer     = '2.3'
 
 function Write-Step   ($m) { Write-Host "  [*] $m" -ForegroundColor Cyan }
 function Write-Ok     ($m) { Write-Host "  [v] $m" -ForegroundColor Green }
@@ -594,15 +594,33 @@ try {
     & icacls.exe $NativeDir /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' /T 2>&1 | Out-Null
     & icacls.exe $NativeDir /inheritance:r /remove:g '*S-1-5-32-545' /T 2>&1 | Out-Null
 } catch { }
-# Verify the installer can still use its own code directory. A quarantined or
-# deny-ACL'd DLL otherwise surfaces later as a cryptic Test-Path failure.
+# Verify the installer can still use its own code directory. An ACL left behind
+# by an older install can deny even Administrators; repair it here instead of
+# surfacing later as a cryptic Test-Path failure. A DENY ACE is never removed.
 $probeFile = Join-Path $NativeDir ('.write-probe-' + [guid]::NewGuid().ToString('N'))
+$probeOk = $false
+$probeErr = ''
 try {
     [IO.File]::WriteAllText($probeFile, 'ok')
     Remove-Item -LiteralPath $probeFile -Force -ErrorAction Stop
-} catch {
-    Write-Err2 "native code directory is not writable: $NativeDir - $($_.Exception.Message)"
-    Write-Warn2 "Inspect it with: icacls `"$NativeDir`"   (do not add antivirus exclusions blindly)"
+    $probeOk = $true
+} catch { $probeErr = $_.Exception.Message }
+if (-not $probeOk) {
+    Write-Warn2 "native code directory is not writable - attempting ACL repair: $NativeDir"
+    try {
+        & takeown.exe /f $NativeDir /r /d y 2>&1 | Out-Null
+        & icacls.exe $NativeDir /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' /T 2>&1 | Out-Null
+        & icacls.exe $NativeDir /inheritance:r /remove:g '*S-1-5-32-545' /T 2>&1 | Out-Null
+        [IO.File]::WriteAllText($probeFile, 'ok')
+        Remove-Item -LiteralPath $probeFile -Force -ErrorAction Stop
+        $probeOk = $true
+        Write-Ok 'native code directory ACL repaired (SYSTEM/Administrators full; no Users:Modify)'
+    } catch { $probeErr = $_.Exception.Message }
+}
+if (-not $probeOk) {
+    Write-Err2 "native code directory is STILL not writable: $NativeDir - $probeErr"
+    (& icacls.exe $NativeDir 2>&1 | Out-String).Trim() | Write-Host
+    Write-Warn2 'A DENY ACE or third-party antivirus lock must be removed manually. No exclusions or deny-ACE removals are performed automatically.'
 }
 $BindNicDll = Join-Path $NativeDir 'bindnic.dll'
 $InjectExe  = Join-Path $NativeDir 'inject.exe'
